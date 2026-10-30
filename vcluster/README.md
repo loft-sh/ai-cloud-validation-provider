@@ -163,8 +163,25 @@ exporter is disabled.
 
 ## Results
 
-Validation against ai-cloud-validation 1.0.0 is in progress. This section will
-list the results of that run.
+Against ai-cloud-validation v1.0.0 on the reference environment above, on
+2026-10-30. Results were not uploaded (`--no-upload`).
+
+**`control-plane`**: all 10 checks passed. `ObjectStorageCrudCheck` is not
+configured: vCluster has no object storage API.
+
+**`k8s`**, every check except the NIM workloads (no NGC API key in that
+environment):
+
+| Result | Checks |
+|---|---|
+| Passed | NodeCount (4 nodes), NodeReady, NvidiaSmi (2 GPU nodes), DriverVersion (580.178.04 on both GPU nodes), GpuPodAccess (1 GPU per node, 2 in total), GpuCapacity, GpuLabels, PodHealth, NoPendingPods, NoErrorPods, NetworkPolicy (allow, ingress-deny, egress-deny), CrdWebhook, NcclMultiNode (2 nodes, average bus bandwidth 0.98 GB/s), GpuStress (2 nodes), ApiServerMetrics, ControlPlaneLogs, ApiNetworkAcl |
+| Reported passed, nothing tested | ExpectedNodes (no node names configured), NcclWorkload (needs 2 GPUs per node; these nodes have 1) |
+| Fail by design | GpuOperatorNamespace, GpuOperatorPods, GpuOperatorOverride (K8S25), Dra (K8S24), OidcIssuer (K8S17-02); see [Known gaps](#known-gaps-against-the-100-suites) |
+| Skipped | MigConfig (no MIG GPUs), DualStackNode (single-stack nodes), ClusterAutoscaler (none installed) |
+| Not configured | The 15 checks whose steps are not wired; see Known gaps |
+
+**CNCF conformance**: a full run passed 441 of 442 specs; its one failure,
+"deny attaching pod", is skipped since (see [CNCF conformance](#cncf-conformance)).
 
 ## How the provider runs the `k8s` suite
 
@@ -252,12 +269,14 @@ list the results of that run.
 
 `K8sCncfConformanceCheck` runs in `certified-conformance` mode. A run with no
 skips on the reference environment ran 443 `[Conformance]` specs: 439 passed and
-4 failed. `config/k8s.yaml` skips one of them, for a vCluster bug, and the
-provider's configuration fixes the other three:
+4 failed. The provider's configuration fixes three of those failures, and
+`config/k8s.yaml` skips two specs for vCluster 0.37.5 behavior found in its
+source:
 
-| Failing spec | Cause | Handling |
+| Spec | Cause | Handling |
 |---|---|---|
-| Pod Generation: 500 podspec updates, `observedGeneration` converges | vCluster 0.37.5 copies the host pod's `status.observedGeneration` into the tenant's pod. The syncer folds rapid updates together, so the host pod ends at generation 490 while the tenant's pod is at 500, and the values never converge | Skipped |
+| Pod Generation: 500 podspec updates, `observedGeneration` converges | vCluster copies the host pod's `status.observedGeneration` into the tenant's pod. The syncer folds rapid updates together, so the host pod ends at generation 490 while the tenant's pod is at 500, and the values never converge | Skipped |
+| AdmissionWebhook: deny attaching pod (intermittent) | vCluster serves exec, attach and port-forward itself, and its syncer calls their admission webhooks on the Service ClusterIP only. Right after a webhook is created, that call can meet a ClusterIP the control plane cluster's kube-proxy has not programmed. Failed in 1 of 3 runs with the webhook routing below; the cause is inferred from the source, not traced | Skipped |
 | EndpointSlice: multiple endpoint IPs, and multiple ports, in multiple EndpointSlices | vCluster 0.37.5 builds the host EndpointSlice's `kubernetes.io/service-name` label without the hashing it applies to host Service names over 63 characters. With a long tenant name the label is invalid and the selector-less Service gets no endpoints | Pass with the default `VCLUSTER_NAME`, `acv-tenant`. Keep it at 14 characters or less |
 | CustomResourceConversionWebhook (either spec, intermittently) | The tenant's API server called the new webhook Service by ClusterIP before the control plane cluster's kube-proxy had programmed it (GKE resyncs at most every 10 s), and the blackholed connection outlasted the spec's 30 s wait | `--enable-aggregator-routing=true` (see above) |
 
