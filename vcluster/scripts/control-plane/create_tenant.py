@@ -86,7 +86,19 @@ def main() -> int:
 
         # Create the tenant (vCluster instance) (--connect=false: no auto port-forward)
         rc, _, stderr = _run(
-            ["vcluster", "create", tenant_name, "--namespace", ns, "--connect=false"],
+            [
+                "vcluster",
+                "create",
+                tenant_name,
+                "--driver",
+                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                "--namespace",
+                ns,
+                "--connect=false",
+                # Same pin as scripts/k8s/setup.sh, so the run does not depend on the local CLI version.
+                "--chart-version",
+                os.environ.get("VCLUSTER_VERSION", "0.37.5"),
+            ],
             env,
         )
         if rc != 0:
@@ -99,7 +111,16 @@ def main() -> int:
 
         for _ in range(60):
             rc2, out2, _ = _run(
-                ["vcluster", "list", "--namespace", ns, "--output", "json"],
+                [
+                    "vcluster",
+                    "list",
+                    "--driver",
+                    os.environ.get("VCLUSTER_DRIVER", "helm"),
+                    "--namespace",
+                    ns,
+                    "--output",
+                    "json",
+                ],
                 env,
             )
             if rc2 == 0 and out2:

@@ -15,23 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""List tenants (vCluster instances) and verify the target tenant is present.
+"""Retrieve details for a specific tenant (vCluster instance).
 
-Uses `vcluster list --namespace <ns> -o json` which outputs a JSON array of
-objects with at minimum the fields: Name, Namespace, Status.
+Parses `vcluster list --namespace <ns> -o json` output to find the named
+tenant's cluster and returns its metadata.
 
 Required JSON output:
 {
-    "success":       bool - true if the list call succeeded,
-    "platform":      str  - "control_plane",
-    "found_target":  bool - true if the target tenant appears in the list,
-    "target_tenant": str  - the name that was searched for,
-    "count":         int  - total number of tenants' clusters listed,
-    "error":         str  - (optional) present when success is false
+    "success":      bool - true if the tenant was found,
+    "platform":     str  - "control_plane",
+    "tenant_name":  str  - vCluster name,
+    "description":  str  - human-readable description,
+    "status":       str  - vCluster status (e.g. "Running"),
+    "error":        str  - (optional) present when success is false
 }
 
 Usage:
-    python list_tenants.py --region vcluster --group-name <tenant-name>
+    python get_tenant.py --group-name <tenant-name> --region vcluster
 """
 
 import argparse
@@ -45,12 +45,6 @@ DEMO_MODE = os.environ.get("ISVCTL_DEMO_MODE") == "1"
 
 
 def _kubeconfig_env() -> dict[str, str]:
-    """Return a copy of os.environ with KUBECONFIG pointed at the control plane cluster.
-
-    VCLUSTER_HOST_KUBECONFIG wins over KUBECONFIG so tests that override the
-    tenant kubeconfig in KUBECONFIG still drive control-plane commands against
-    the control plane cluster where the vCluster instance runs.
-    """
     env = os.environ.copy()
     host_kc = env.get("VCLUSTER_HOST_KUBECONFIG") or env.get("KUBECONFIG", "")
     if host_kc:
@@ -59,16 +53,14 @@ def _kubeconfig_env() -> dict[str, str]:
 
 
 def _run(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str]:
-    """Run ``cmd`` and return ``(exit_code, stripped_stdout, stripped_stderr)``."""
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def main() -> int:
-    """List vCluster tenants in the configured namespace and report whether the target exists."""
-    parser = argparse.ArgumentParser(description="List tenants (vCluster instances)")
+    parser = argparse.ArgumentParser(description="Get tenant (vCluster instance) details")
+    parser.add_argument("--group-name", required=True, help="Tenant cluster name")
     parser.add_argument("--region", required=True, help="Region label (use 'vcluster')")
-    parser.add_argument("--group-name", required=True, help="Target tenant name to look for")
     args = parser.parse_args()
 
     ns = os.environ.get("VCLUSTER_NAMESPACE", args.group_name)
@@ -76,14 +68,15 @@ def main() -> int:
     result: dict[str, Any] = {
         "success": False,
         "platform": "control_plane",
-        "found_target": False,
-        "target_tenant": args.group_name,
-        "count": 0,
+        "tenant_name": "",
+        "description": "tenant (vCluster instance)",
+        "status": "",
     }
 
     if DEMO_MODE:
-        result["found_target"] = True
-        result["count"] = 1
+        result["tenant_name"] = args.group_name
+        result["tenant_id"] = args.group_name
+        result["status"] = "Running"
         result["success"] = True
         print(json.dumps(result, indent=2))
         return 0
@@ -92,28 +85,43 @@ def main() -> int:
         env = _kubeconfig_env()
 
         rc, out, stderr = _run(
-            ["vcluster", "list", "--namespace", ns, "--output", "json"],
+            [
+                "vcluster",
+                "list",
+                "--driver",
+                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                "--namespace",
+                ns,
+                "--output",
+                "json",
+            ],
             env,
         )
 
         if rc != 0:
-            # Keep the JSON contract provider-neutral; raw CLI diagnostics
-            # go to stderr where the orchestrator can pick them up.
-            print(f"vcluster list failed: {stderr}", file=sys.stderr)
-            result["error"] = "vcluster list failed"
+            result["error"] = f"vcluster list failed: {stderr}"
             print(json.dumps(result, indent=2))
             return 1
 
         try:
             vclusters = json.loads(out) if out else []
         except json.JSONDecodeError:
-            # vcluster list may emit non-JSON when the list is empty
             vclusters = []
 
-        result["count"] = len(vclusters)
-        result["found_target"] = any(
-            vc.get("Name") == args.group_name or vc.get("name") == args.group_name for vc in vclusters
+        target = next(
+            (vc for vc in vclusters if vc.get("Name") == args.group_name or vc.get("name") == args.group_name),
+            None,
         )
+
+        if target is None:
+            result["error"] = f"vCluster '{args.group_name}' not found in namespace '{ns}'"
+            print(json.dumps(result, indent=2))
+            return 1
+
+        result["tenant_name"] = target.get("Name") or target.get("name", args.group_name)
+        result["tenant_id"] = result["tenant_name"]
+        result["status"] = target.get("Status") or target.get("status", "unknown")
+        result["description"] = "tenant (vCluster instance)"
         result["success"] = True
 
     except Exception as exc:  # pylint: disable=broad-except

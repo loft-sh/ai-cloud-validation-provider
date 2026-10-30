@@ -13,12 +13,12 @@ and has its own registry entry.
 
 | Provider | Tenancy model | Suites | Validated against |
 |---|---|---|---|
-| [`vcluster-shared-nodes`](vcluster-shared-nodes/) | Shared Nodes | `k8s`, `control-plane` | 1.0.0 (in progress) |
+| [`vcluster`](vcluster/) | Shared Nodes | `k8s`, `control-plane` | 1.0.0 (in progress) |
 
 ## Reproducing the results
 
 Prerequisites, credentials and the exact commands are in
-[vcluster-shared-nodes/README.md](vcluster-shared-nodes/README.md#reproducing).
+[vcluster/README.md](vcluster/README.md#reproducing).
 
 ## Continuous checks
 
@@ -27,6 +27,13 @@ provider config against the latest ai-cloud-validation release with `--dry-run`
 on every change and every week, which is the check NVIDIA's registry CI runs.
 It needs no cluster: it catches a release that changes the suite contract, not
 a platform regression.
+
+## Community and security
+
+- [Contributing](CONTRIBUTING.md): checks to run before a pull request, and how a
+  validated commit reaches the registry.
+- [Security](SECURITY.md): private vulnerability reporting, and what the
+  scripts do on the machine and clusters they run against.
 
 ## License
 

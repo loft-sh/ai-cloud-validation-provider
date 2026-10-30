@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vCluster (Shared Nodes) provider - control-plane suite
+# vCluster provider - control-plane suite
 #
 # Imports the provider-agnostic control-plane suite from an ai-cloud-validation
 # checkout and wires it to the vCluster scripts in ../scripts/control-plane/.
@@ -23,6 +23,9 @@
 #   "access_key" = a Kubernetes ServiceAccount + bound token in that namespace
 #
 # Environment variables:
+#   VCLUSTER_DRIVER           - vcluster CLI driver (default: helm)
+#   VCLUSTER_VERSION          - vCluster chart version for created tenants
+#                               (default: 0.37.5)
 #   VCLUSTER_NAMESPACE        - namespace where vCluster instances live
 #                               (default: vcluster-isv-validation)
 #   VCLUSTER_HOST_KUBECONFIG  - path to the control plane cluster kubeconfig
@@ -32,7 +35,7 @@
 # storage API, so ObjectStorageCrudCheck reports step_not_configured.
 #
 # Usage, from the root of an ai-cloud-validation checkout:
-#   uv run isvctl test run --provider vcluster-shared-nodes --suite control-plane
+#   uv run isvctl test run --provider vcluster --suite control-plane
 
 import:
   - isvctl/configs/suites/control-plane.yaml
@@ -59,7 +62,8 @@ commands:
         phase: setup
         command: "python ../scripts/control-plane/create_tenant.py"
         args: ["--region", "{{region}}"]
-        timeout: 300
+        # vcluster create, then up to 5 minutes waiting for Running.
+        timeout: 600
 
       - name: test_access_key
         phase: test

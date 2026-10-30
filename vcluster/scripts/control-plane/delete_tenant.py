@@ -84,7 +84,15 @@ def main() -> int:
         env = _kubeconfig_env()
 
         rc, stdout, stderr = _run(
-            ["vcluster", "delete", args.group_name, "--namespace", ns],
+            [
+                "vcluster",
+                "delete",
+                args.group_name,
+                "--driver",
+                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                "--namespace",
+                ns,
+            ],
             env,
         )
 

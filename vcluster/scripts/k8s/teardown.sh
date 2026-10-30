@@ -19,13 +19,15 @@
 # the kubeconfig written by setup.sh.
 #
 # Environment variables:
-#   VCLUSTER_NAME             - name of the tenant's cluster (default: vcluster-isv-validation)
+#   VCLUSTER_DRIVER           - vcluster CLI driver (default: helm)
+#   VCLUSTER_NAME             - name of the tenant's cluster (default: acv-tenant)
 #   VCLUSTER_NAMESPACE        - namespace on the control plane cluster (default: vcluster-isv-validation)
 #   VCLUSTER_KUBECONFIG_PATH  - persisted kubeconfig path to remove (default: /tmp/vcluster-isv-validation.kubeconfig)
 
 set -eo pipefail
 
-VCLUSTER_NAME="${VCLUSTER_NAME:-vcluster-isv-validation}"
+VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-helm}"
+VCLUSTER_NAME="${VCLUSTER_NAME:-acv-tenant}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
 GPU_TAINT_STATE_FILE="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}-gpu-taints.txt"
@@ -67,7 +69,7 @@ rm -f /tmp/vcluster-isv-lb-ip.txt
 echo "Deleting vCluster '${VCLUSTER_NAME}' from namespace '${VCLUSTER_NAMESPACE}'..." >&2
 
 DELETE_RC=0
-DELETE_OUT=$(vcluster delete "$VCLUSTER_NAME" --namespace "$VCLUSTER_NAMESPACE" 2>&1) || DELETE_RC=$?
+DELETE_OUT=$(vcluster delete "$VCLUSTER_NAME" --driver "$VCLUSTER_DRIVER" --namespace "$VCLUSTER_NAMESPACE" 2>&1) || DELETE_RC=$?
 
 if [ "$DELETE_RC" -ne 0 ]; then
     if echo "$DELETE_OUT" | grep -qi "not found\|does not exist\|couldn't find"; then
@@ -81,6 +83,9 @@ else
     echo "$DELETE_OUT" >&2
     echo "vCluster deleted." >&2
 fi
+
+# Remove the files setup.sh wrote for the API network ACL check
+rm -f /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
 
 # Remove the persisted kubeconfig
 if [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
