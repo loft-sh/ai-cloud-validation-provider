@@ -1,0 +1,75 @@
+name: Validate against ai-cloud-validation
+
+# Loads every provider config against the latest ai-cloud-validation release
+# with --dry-run, the check NVIDIA's registry CI runs on registered entries:
+# the configs must load against the current suites. No provider script runs,
+# so no cluster or credentials are needed. The weekly run catches a new
+# release changing the suite contract.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Resolve latest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Find the newest vX.Y.Z tag
+        id: tag
+        run: |
+          TAG=$(git ls-remote --tags --refs https://github.com/NVIDIA/ai-cloud-validation.git \
+            | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No vX.Y.Z release tag found in NVIDIA/ai-cloud-validation."
+            exit 1
+          fi
+          echo "Latest release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  dry-run:
+    name: ${{ matrix.provider }} ${{ matrix.suite }}
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [vcluster-shared-nodes]
+        suite: [k8s, control-plane]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NVIDIA/ai-cloud-validation
+          ref: ${{ needs.release.outputs.tag }}
+          path: validation
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: provider
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Install ai-cloud-validation
+        working-directory: validation
+        run: uv sync --locked
+
+      # Provider configs import suites by paths relative to the validation
+      # checkout root, so the run starts there.
+      - name: Dry-run
+        working-directory: validation
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          SUITE: ${{ matrix.suite }}
+        run: uv run isvctl test run --no-upload --dry-run -f "../provider/$PROVIDER/config/$SUITE.yaml"
