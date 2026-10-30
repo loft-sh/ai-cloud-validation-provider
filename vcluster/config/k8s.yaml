@@ -118,12 +118,16 @@ tests:
     k8s_observability:
       checks:
         K8sControlPlaneLogsCheck:
+          # The Virtual Control Plane runs the API server, scheduler and
+          # controller manager in the vCluster pod's syncer container, so all
+          # three components log there. The pod is selected by label because its
+          # name depends on the workload kind the chart picks.
           mode: "command"
           components: ["kube-apiserver", "kube-scheduler", "kube-controller-manager"]
           commands:
-            kube-apiserver: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs ${VCLUSTER_NAME:-vcluster-isv-validation}-0 -c syncer --tail=100 2>/dev/null"
-            kube-scheduler: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs ${VCLUSTER_NAME:-vcluster-isv-validation}-0 -c syncer --tail=100 2>/dev/null"
-            kube-controller-manager: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs ${VCLUSTER_NAME:-vcluster-isv-validation}-0 -c syncer --tail=100 2>/dev/null"
+            kube-apiserver: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-vcluster-isv-validation} -c syncer --tail=100 2>/dev/null"
+            kube-scheduler: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-vcluster-isv-validation} -c syncer --tail=100 2>/dev/null"
+            kube-controller-manager: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-vcluster-isv-validation} -c syncer --tail=100 2>/dev/null"
 
     kubernetes:
       checks:

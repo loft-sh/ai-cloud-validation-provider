@@ -105,10 +105,54 @@ deletes the vCluster instance and restores the GPU node taints.
 
 | | |
 |---|---|
-| Control plane cluster | GKE Standard, zonal, Kubernetes 1.36, Calico network policy, COS nodes with GKE-managed NVIDIA drivers and device plugin (no GPU Operator) |
+| Control plane cluster | GKE Standard, zonal, Kubernetes 1.36, Calico network policy, COS nodes |
+| GPU stack | NVIDIA GPU Operator v26.7.2 on the control plane cluster, as [NVIDIA documents for GKE COS](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/google-gke.html): GKE installs the driver, GKE's own device plugin is disabled, the operator runs the device plugin, GFD and toolkit (CDI); GKE's managed DCGM exporter collects GPU metrics |
 | vCluster | 0.37.5, tenant's cluster on Kubernetes 1.36.6 |
 | `default-pool` | 2x e2-standard-4 |
 | `gpu-t4-pool` | 2x n1-standard-4, 1x NVIDIA T4 16 GB each: GPU, NCCL, stress and NIM workloads |
+
+### Preparing a GKE control plane cluster
+
+```bash
+gcloud container clusters create <cluster> --zone <zone> --release-channel regular \
+  --machine-type e2-standard-4 --num-nodes 2 --enable-network-policy
+gcloud container node-pools create gpu-t4-pool --cluster <cluster> --zone <zone> \
+  --machine-type n1-standard-4 --num-nodes 2 --disk-size 200 \
+  --accelerator type=nvidia-tesla-t4,count=1,gpu-driver-version=default \
+  --node-labels=gke-no-default-nvidia-gpu-device-plugin=true
+
+# GPU Operator: GKE's driver, the operator's device plugin, GFD and toolkit
+kubectl create namespace gpu-operator
+kubectl apply -n gpu-operator -f - <<'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: gpu-operator-quota
+spec:
+  hard:
+    pods: 100
+  scopeSelector:
+    matchExpressions:
+    - operator: In
+      scopeName: PriorityClass
+      values: [system-node-critical, system-cluster-critical]
+EOF
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm install gpu-operator nvidia/gpu-operator --version v26.7.2 -n gpu-operator --wait \
+  --set driver.enabled=false --set cdi.enabled=true --set cdi.default=true \
+  --set hostPaths.driverInstallDir=/home/kubernetes/bin/nvidia \
+  --set toolkit.installDir=/home/kubernetes/bin/nvidia \
+  --set 'toolkit.env[0].name=RUNTIME_CONFIG_SOURCE' --set 'toolkit.env[0].value=file' \
+  --set dcgmExporter.enabled=false
+```
+
+NVIDIA's guide installs the COS driver with Google's driver installer
+DaemonSet and `gpu-driver-version=disabled`; letting GKE install it
+(`gpu-driver-version=default`) puts the same driver in the same place. The
+`RUNTIME_CONFIG_SOURCE=file` toolkit setting is NVIDIA's workaround for GKE 1.33
+and newer. GKE already runs a managed DCGM exporter on GPU nodes, and two DCGM
+instances cannot both watch the profiling metrics, so the operator's DCGM
+exporter is disabled.
 
 ## Results
 
@@ -133,9 +177,13 @@ list the results of that run.
   `K8sGpuOperatorNamespaceCheck` and `K8sGpuOperatorPodsCheck` fail by design.
   When the control plane cluster has no GPU stack, `setup.sh` installs the GPU
   Operator with `driver.enabled=false`.
-- **GPU labels.** `K8sGpuLabelsCheck` looks for GPU Feature Discovery's
-  `nvidia.com/gpu.present=true`. GFD does not run on GKE COS, so on GKE the
-  check uses GKE's own GPU node label, `cloud.google.com/gke-accelerator`.
+- **GPU labels and driver version.** The suite finds GPU nodes by GPU Feature
+  Discovery's `nvidia.com/gpu.present=true` label and reads the driver version
+  from GFD's `nvidia.com/cuda.driver.*` labels, so the reference environment
+  runs the GPU Operator. On GKE without it, `setup.sh` points
+  `K8sGpuLabelsCheck` at GKE's own `cloud.google.com/gke-accelerator` label and
+  reports no driver version, which makes `K8sDriverVersionCheck` skip; GPU node
+  discovery in `K8sGpuPodAccessCheck` still needs GFD.
 - **API network ACL.** On cloud clusters the tenant's API server is reachable
   only through a LoadBalancer whose `loadBalancerSourceRanges` admit
   `VCLUSTER_API_ALLOWED_CIDRS`. `K8sApiNetworkAclCheck` requires kubectl from

@@ -592,12 +592,12 @@ REQUIRE_JQ="true"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # _common.sh sets runtime_class="nvidia" whenever a nvidia RuntimeClass object
-# exists in the tenant.  On GKE COS, GPU pods access devices through the device
-# plugin (nvidia.com/gpu: 1 resource request) without needing runtimeClassName:
-# nvidia in the container spec - the nvidia container runtime handler is not
-# configured in containerd on GKE COS nodes.  Setting runtime_class="" prevents
-# isvtest from adding runtimeClassName: nvidia to its test pods, which would fail
-# with "no runtime for nvidia is configured".
+# exists in the tenant. On GKE COS, GPU pods get their devices from the device
+# plugin (and through CDI when the GPU Operator runs), so test pods need no
+# runtimeClassName: nvidia; without the GPU Operator's toolkit containerd has no
+# nvidia handler at all. Without the GPU Operator (HOST_GFD=false), GPU Feature
+# Discovery does not run either, so there are no driver labels to read a version
+# from, and GPU nodes carry GKE's own label instead of nvidia.com/gpu.present.
 if [ "${CLOUD_PROVIDER:-}" = "gke" ]; then
     _COMMON_JSON=$(
         CLUSTER_NAME="$CLUSTER_NAME"
@@ -606,20 +606,15 @@ if [ "${CLOUD_PROVIDER:-}" = "gke" ]; then
         # shellcheck source=_common.sh
         source "$SCRIPT_DIR/_common.sh"
     )
-    echo "$_COMMON_JSON" | python3 -c "
-import json, sys
+    echo "$_COMMON_JSON" | HOST_GFD="$HOST_GFD" python3 -c "
+import json, os, sys
 data = json.load(sys.stdin)
 k8s = data.setdefault('kubernetes', {})
-# GKE COS: no nvidia container runtime handler in containerd; device plugin
-# handles GPU access via nvidia.com/gpu resource request, not runtimeClassName.
 k8s['runtime_class'] = ''
-# GKE manages GPU drivers natively; GFD labels (nvidia.com/cuda.driver.*) are
-# not published on GKE COS nodes so the version resolves to 'unknown'.
-# Always clear so K8sDriverVersionCheck skips the comparison on GKE.
-k8s['driver_version'] = ''
-# GKE's own GPU node label: GPU Feature Discovery (nvidia.com/gpu.present) does
-# not run on GKE COS nodes.
-k8s['gpu_label_selector'] = 'cloud.google.com/gke-accelerator'
+if os.environ.get('HOST_GFD') != 'true':
+    # K8sDriverVersionCheck skips without a version; K8sGpuLabelsCheck uses GKE's label.
+    k8s['driver_version'] = ''
+    k8s['gpu_label_selector'] = 'cloud.google.com/gke-accelerator'
 print(json.dumps(data, indent=2))
 "
 else
