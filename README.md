@@ -28,6 +28,13 @@ on every change and every week, which is the check NVIDIA's registry CI runs.
 It needs no cluster: it catches a release that changes the suite contract, not
 a platform regression.
 
+## Community and security
+
+- [Contributing](CONTRIBUTING.md): checks to run before a pull request, and how a
+  validated commit reaches the registry.
+- [Security](SECURITY.md): private vulnerability reporting, and what the
+  scripts do on the machine and clusters they run against.
+
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).
