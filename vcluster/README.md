@@ -47,6 +47,9 @@ On the machine that runs the suites:
 | `helm` | 3.14 or newer, 3.x | GPU Operator (when needed) and NIM charts |
 | `jq`, `python3`, `curl` | any | Used by the setup and teardown scripts |
 
+Everything `setup.sh` and the control-plane scripts enable is in open-source
+vCluster, so no vCluster Platform login or license is needed.
+
 The API allowlist defaults to this machine's public IPv4 address, so that
 address must not change during a run. Otherwise set `VCLUSTER_API_ALLOWED_CIDRS`
 to a stable range, such as your office or VPN egress.
@@ -116,8 +119,8 @@ list the results of that run.
 
 - **vCluster configuration.** `setup.sh` follows vCluster's
   [CNCF-certified Shared Nodes configuration](https://github.com/cncf/k8s-conformance/tree/master/v1.36/vcluster-with-shared-nodes)
-  (virtual scheduler, real node addresses, PersistentVolume, PriorityClass and
-  StorageClass sync) and adds what GPU workloads need: node sync with all
+  (virtual scheduler, chart-deployed etcd, real node addresses,
+  PersistentVolume, PriorityClass and StorageClass sync) and adds what GPU workloads need: node sync with all
   labels and capacity, NetworkPolicy sync, and an `nvidia` RuntimeClass.
 - **GPU access.** On GKE COS nodes containerd has no `nvidia` runtime handler,
   so GPU pods only request `nvidia.com/gpu` and the workloads set
@@ -162,8 +165,9 @@ list the results of that run.
   in-cluster issuer, so the check fails unless the issuer is published at a
   public HTTPS URL.
 - **DRA (K8S24-01).** Needs a DRA driver on the control plane cluster plus
-  `sync.fromHost.deviceClasses` and `sync.toHost.resourceClaims`. The reference
-  environment uses the device plugin, so the check fails.
+  `sync.fromHost.deviceClasses` and `sync.toHost.resourceClaims`, which are
+  vCluster Platform features. The reference environment uses the device plugin
+  and open-source vCluster, so the check fails.
 - **Steps not wired.** Node pools, `reset_gpus` and `cordon_node` act on the
   control plane cluster's nodes, which the platform operator manages.
   Control-plane sizing, version listing, patching, upgrades, service account

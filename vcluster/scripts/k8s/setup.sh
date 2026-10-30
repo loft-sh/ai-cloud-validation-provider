@@ -140,10 +140,13 @@ if [ -z "$EXISTING_STATUS" ]; then
         # The 'nvidia' RuntimeClass is created explicitly in the tenant after connect.
         --set sync.fromHost.runtimeClasses.enabled=false
         --set sync.toHost.networkPolicies.enabled=true
-        # Use embedded etcd instead of kine/SQLite so that list continue tokens are
-        # properly expired by compaction.  This allows the "compacted away" CNCF
-        # conformance test to pass (kine does not invalidate tokens on compaction).
-        --set controlPlane.backingStore.etcd.embedded.enabled=true
+        # Back the Virtual Control Plane with a real etcd instead of the default
+        # embedded database (kine/SQLite), so list continue tokens expire on
+        # compaction as the "compacted away" conformance test expects. The
+        # chart-deployed etcd is open source and is what the CNCF-certified
+        # Shared Nodes configuration uses; embedded etcd is a vCluster Platform
+        # feature and would require a Platform login.
+        --set controlPlane.backingStore.etcd.deploy.enabled=true
         # Ensure the virtual control plane has sufficient scheduling headroom for
         # CNCF conformance (441 tests, each creating a namespace and waiting for
         # the default ServiceAccount to be created).  No CPU limit is set so
