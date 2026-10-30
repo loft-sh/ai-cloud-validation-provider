@@ -28,6 +28,8 @@
 #
 # Environment variables:
 #   VCLUSTER_VERSION         - vCluster chart version to deploy (default: 0.37.5)
+#   VCLUSTER_DRIVER          - vcluster CLI driver (default: helm, so a CLI configured
+#                              for Docker still deploys into the control plane cluster)
 #   VCLUSTER_NAME            - tenant's cluster name (default: vcluster-isv-validation)
 #   VCLUSTER_NAMESPACE       - host namespace      (default: vcluster-isv-validation)
 #   VCLUSTER_KUBECONFIG_PATH - where to write the tenant kubeconfig
@@ -57,6 +59,7 @@ for tool in vcluster kubectl helm jq python3 curl; do
 done
 
 VCLUSTER_VERSION="${VCLUSTER_VERSION:-0.37.5}"
+VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-helm}"
 VCLUSTER_NAME="${VCLUSTER_NAME:-vcluster-isv-validation}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
@@ -112,7 +115,7 @@ fi
 # --expose: creates a LoadBalancer service and embeds the LB IP in the TLS
 # cert so that vcluster connect --print produces a stable kubeconfig endpoint.
 # ---------------------------------------------------------------------------
-EXISTING_STATUS=$(vcluster list --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
+EXISTING_STATUS=$(vcluster list --driver "$VCLUSTER_DRIVER" --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
     | python3 -c "
 import json, sys
 items = json.load(sys.stdin) or []
@@ -124,6 +127,7 @@ if [ -z "$EXISTING_STATUS" ]; then
     echo "Creating vCluster '${VCLUSTER_NAME}' (chart ${VCLUSTER_VERSION}) in namespace '${VCLUSTER_NAMESPACE}'..." >&2
     CREATE_ARGS=(
         "$VCLUSTER_NAME"
+        --driver "$VCLUSTER_DRIVER"
         --namespace "$VCLUSTER_NAMESPACE"
         # Pin the chart so a run is reproducible; otherwise the CLI deploys its own version.
         --chart-version "$VCLUSTER_VERSION"
@@ -179,7 +183,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "Waiting for vCluster to reach Running status..." >&2
 for i in $(seq 1 60); do
-    STATUS=$(vcluster list --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
+    STATUS=$(vcluster list --driver "$VCLUSTER_DRIVER" --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
         | python3 -c "
 import json, sys
 items = json.load(sys.stdin) or []
@@ -303,6 +307,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "Connecting to vCluster, saving kubeconfig to ${VCLUSTER_KUBECONFIG_PATH}..." >&2
 vcluster connect "$VCLUSTER_NAME" \
+    --driver "$VCLUSTER_DRIVER" \
     --namespace "$VCLUSTER_NAMESPACE" \
     --print \
     2>/dev/null > "$VCLUSTER_KUBECONFIG_PATH"

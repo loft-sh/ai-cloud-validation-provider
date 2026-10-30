@@ -92,7 +92,7 @@ def main() -> int:
         env = _kubeconfig_env()
 
         rc, out, stderr = _run(
-            ["vcluster", "list", "--namespace", ns, "--output", "json"],
+            ["vcluster", "list", "--driver", os.environ.get("VCLUSTER_DRIVER", "helm"), "--namespace", ns, "--output", "json"],
             env,
         )
 

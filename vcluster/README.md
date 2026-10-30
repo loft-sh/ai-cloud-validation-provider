@@ -59,6 +59,7 @@ to a stable range, such as your office or VPN egress.
 | `KUBECTL` | `k8s` suite | | `kubectl --kubeconfig=<VCLUSTER_KUBECONFIG_PATH>`, so the validations probe the tenant's cluster |
 | `NGC_API_KEY` | `k8s` suite | | NGC API key for nvcr.io pulls and the NIM workloads |
 | `VCLUSTER_VERSION` | no | `0.37.5` | vCluster chart version that `setup.sh` and `create_tenant.py` deploy |
+| `VCLUSTER_DRIVER` | no | `helm` | vcluster CLI driver; `helm` deploys into the control plane cluster even if your CLI defaults to Docker |
 | `VCLUSTER_NAME` | no | `vcluster-isv-validation` | Name of the vCluster instance |
 | `VCLUSTER_NAMESPACE` | no | `vcluster-isv-validation` | Its namespace on the control plane cluster |
 | `VCLUSTER_KUBECONFIG_PATH` | no | `/tmp/vcluster-isv-validation.kubeconfig` | Where `setup.sh` writes the tenant's kubeconfig |
