@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vCluster (Shared Nodes) provider - Kubernetes suite
+# vCluster provider - Kubernetes suite
 #
 # Imports the provider-agnostic k8s suite from an ai-cloud-validation checkout
 # and wires it to the vCluster scripts in ../scripts/k8s/. vCluster runs a
@@ -24,7 +24,7 @@
 # cluster's GPU nodes through sync.fromHost.nodes.
 #
 # Prerequisites (../README.md has the full list and how to reproduce a run):
-#   - vcluster CLI matching VCLUSTER_VERSION, kubectl, helm, jq, python3
+#   - vcluster CLI matching VCLUSTER_VERSION, kubectl, helm, jq, python3, curl
 #   - KUBECONFIG pointing at the control plane cluster
 #   - A control plane cluster CNI that enforces NetworkPolicies (for example
 #     GKE --enable-network-policy) for K8sNetworkPolicyCheck
@@ -36,21 +36,21 @@
 #   - VCLUSTER_NAMESPACE       (default: vcluster-isv-validation)
 #   - VCLUSTER_KUBECONFIG_PATH (default: /tmp/vcluster-isv-validation.kubeconfig)
 #   - SKIP_PREFLIGHT           (default: false) - "true" skips GPU readiness waits
+#   - VCLUSTER_API_ALLOWED_CIDRS (default: the runner's public IPv4/32) - CIDRs
+#     admitted by the tenant API LoadBalancer (K8sApiNetworkAclCheck)
 #
 # GPU architecture:
 #   sync.fromHost.nodes.enabled=true            nodes, labels and GPU capacity
 #   sync.fromHost.runtimeClasses.enabled=false  setup.sh creates the nvidia RuntimeClass
 #
-#   When the control plane cluster already runs the GPU Operator
-#   (nvidia.com/gpu.present=true on its nodes), setup.sh creates the
-#   gpu-operator namespace in the tenant's cluster with a placeholder
-#   Deployment (registry.k8s.io/pause) instead of installing the chart, because
-#   the chart would sync a second device plugin, GFD and toolkit onto the
-#   shared nodes. K8sGpuOperatorNamespaceCheck and K8sGpuOperatorPodsCheck
-#   therefore observe the placeholder; the GPU Operator itself stays
-#   operator-managed on the control plane cluster. Without a GPU Operator on
-#   the control plane cluster, setup.sh installs the chart with
-#   driver.enabled=false.
+#   When the control plane cluster already runs the GPU stack (the GPU Operator,
+#   or a cloud's managed drivers and device plugin), setup.sh installs nothing
+#   in the tenant's cluster: the operator's DaemonSets would sync a second
+#   device plugin onto the same nodes. The GPU stack belongs to the platform
+#   operator and the tenant can neither see nor replace it, so
+#   K8sGpuOperatorNamespaceCheck and K8sGpuOperatorPodsCheck fail by design
+#   (requirement K8S25). Without a GPU stack on the control plane cluster,
+#   setup.sh installs the GPU Operator with driver.enabled=false.
 #
 # CNCF conformance and GPU taints:
 #   setup.sh temporarily removes the nvidia.com/gpu:NoSchedule taint from the
@@ -60,15 +60,15 @@
 #
 # Steps from the 1.0.0 k8s suite that this config does not wire (their checks
 # report step_not_configured): node pools, reset_gpus and cordon_node act on
-# shared nodes, which the platform operator manages, so they are not tenant
-# operations here; pin_control_plane, list_k8s_versions,
+# the control plane cluster's nodes, which the platform operator manages, so
+# they are not tenant operations here; pin_control_plane, list_k8s_versions,
 # describe_control_plane_patching, the upgrade steps, service_account_iam_test
 # and the k8s_{load_balancer,dns_forwarding,cidr_ranges}_test probes still
 # need vCluster-specific implementations.
 #
 # Usage, from the root of an ai-cloud-validation checkout:
 #   KUBECTL="kubectl --kubeconfig=/tmp/vcluster-isv-validation.kubeconfig" \
-#     uv run isvctl test run --provider vcluster-shared-nodes --suite k8s
+#     uv run isvctl test run --provider vcluster --suite k8s
 #
 #   KUBECTL must point at the tenant's cluster so the validations probe it.
 #   setup.sh ignores KUBECTL and uses the ambient KUBECONFIG (the control plane
@@ -95,30 +95,25 @@ commands:
 
 tests:
   cluster_name: "vcluster-isv-validation"
-  description: "vCluster (Shared Nodes) validation on NVIDIA GPU nodes"
+  description: "vCluster validation on NVIDIA GPU nodes"
 
   validations:
     k8s_network:
       checks:
         K8sApiNetworkAclCheck:
-          # The vCluster API server is exposed on a LoadBalancer with TLS. The
-          # tenant kubeconfig holds a bound ServiceAccount token, so kubectl
-          # presents valid credentials and the authorized probe succeeds.
-          #
-          # The unauthorized probe curls the LB IP without any credentials
-          # (no Authorization header, no cert). The vCluster API server
-          # responds 401 Unauthorized for the /api endpoint, and curl -f
-          # exits 22 on HTTP errors, so the probe registers as "blocked"
-          # without needing IP-level ACL enforcement.
-          #
-          # An earlier iteration used loadBalancerSourceRanges to restrict
-          # the LB to RFC1918 and tunnelled kubectl through a localhost
-          # port-forward. That setup proved unreliable for streaming the
-          # multi-megabyte conformance JUnit through `kubectl exec`, so we
-          # rely on the protocol-layer 401 instead.
-          probe_timeout_s: 30
+          # Requirement K8S15: the cluster endpoint must provide network access
+          # controls. setup.sh exposes the tenant's API through a LoadBalancer
+          # whose loadBalancerSourceRanges admit only VCLUSTER_API_ALLOWED_CIDRS
+          # (default: the runner's public IPv4 address). The authorized probe
+          # (kubectl from the runner) must succeed. The unauthorized probe,
+          # written by setup.sh, connects from a pod in the cluster, which is
+          # outside the allowlist, and must be blocked at the network layer.
+          # It exits 0 on any HTTP answer, a 401 included, so an authentication
+          # error never counts as an ACL; it exits 127 if the probe pod cannot
+          # run, which the check reports as a failure.
+          probe_timeout_s: 120
           commands:
-            unauthorized_probe: "LB=$(cat /tmp/vcluster-isv-lb-ip.txt 2>/dev/null); [ -z \"$LB\" ] && exit 1; curl -f --max-time 15 --insecure --silent -o /dev/null https://${LB}/api"
+            unauthorized_probe: "bash /tmp/vcluster-isv-acl-probe.sh"
 
     k8s_observability:
       checks:

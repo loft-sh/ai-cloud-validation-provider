@@ -13,12 +13,12 @@ and has its own registry entry.
 
 | Provider | Tenancy model | Suites | Validated against |
 |---|---|---|---|
-| [`vcluster-shared-nodes`](vcluster-shared-nodes/) | Shared Nodes | `k8s`, `control-plane` | 1.0.0 (in progress) |
+| [`vcluster`](vcluster/) | Shared Nodes | `k8s`, `control-plane` | 1.0.0 (in progress) |
 
 ## Reproducing the results
 
 Prerequisites, credentials and the exact commands are in
-[vcluster-shared-nodes/README.md](vcluster-shared-nodes/README.md#reproducing).
+[vcluster/README.md](vcluster/README.md#reproducing).
 
 ## Continuous checks
 

@@ -34,12 +34,14 @@
 #                              (default: /tmp/vcluster-isv-validation.kubeconfig)
 #   VCLUSTER_EXPOSE          - "true" to expose the tenant API via a LoadBalancer
 #                              service (recommended for cloud; auto-detected)
-#   NGC_API_KEY              - NGC token for nvcr.io pulls (GPU Operator + NIM)
+#   VCLUSTER_API_ALLOWED_CIDRS - comma-separated CIDRs allowed to reach that
+#                              LoadBalancer (default: this machine's public IPv4/32)
+#   NGC_API_KEY             - NGC token for nvcr.io pulls (GPU Operator + NIM)
 #   SKIP_PREFLIGHT           - "true" to skip GPU-readiness checks (default: false)
 #
 # Usage, from the root of an ai-cloud-validation checkout (see ../../README.md):
 #   KUBECTL="kubectl --kubeconfig=/tmp/vcluster-isv-validation.kubeconfig" \
-#     uv run isvctl test run --provider vcluster-shared-nodes --suite k8s
+#     uv run isvctl test run --provider vcluster --suite k8s
 #   Add --phase setup|test|teardown to run a single phase.
 
 set -eo pipefail
@@ -47,7 +49,7 @@ set -eo pipefail
 # ---------------------------------------------------------------------------
 # Tooling check
 # ---------------------------------------------------------------------------
-for tool in vcluster kubectl helm jq python3; do
+for tool in vcluster kubectl helm jq python3 curl; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Error: '$tool' not found in PATH." >&2
         exit 1
@@ -86,6 +88,24 @@ except Exception: print('')
         VCLUSTER_EXPOSE="true"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# API endpoint allowlist (requirement K8S15: the cluster endpoint must provide
+# network access controls). The LoadBalancer only admits
+# VCLUSTER_API_ALLOWED_CIDRS; by default that is this machine's public IPv4
+# address, so keep it stable for the whole run (or set the variable to your
+# office or VPN range).
+# ---------------------------------------------------------------------------
+VCLUSTER_API_ALLOWED_CIDRS="${VCLUSTER_API_ALLOWED_CIDRS:-}"
+if [ "${VCLUSTER_EXPOSE:-false}" = "true" ] && [ -z "$VCLUSTER_API_ALLOWED_CIDRS" ]; then
+    _RUNNER_IP=$(curl -4 -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
+    if ! [[ "$_RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: could not detect this machine's public IPv4 address; set VCLUSTER_API_ALLOWED_CIDRS." >&2
+        exit 1
+    fi
+    VCLUSTER_API_ALLOWED_CIDRS="${_RUNNER_IP}/32"
+fi
+[ "${VCLUSTER_EXPOSE:-false}" = "true" ] && echo "API LoadBalancer allowlist: ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
 
 # ---------------------------------------------------------------------------
 # Create vCluster (skip if already Running)
@@ -146,7 +166,9 @@ if [ -z "$EXISTING_STATUS" ]; then
         --set sync.fromHost.csiDrivers.enabled=false
         --set sync.fromHost.csiStorageCapacities.enabled=false
     )
-    [ "${VCLUSTER_EXPOSE:-false}" = "true" ] && CREATE_ARGS+=(--expose)
+    if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
+        CREATE_ARGS+=(--expose --set "controlPlane.service.spec.loadBalancerSourceRanges={${VCLUSTER_API_ALLOWED_CIDRS}}")
+    fi
     vcluster create "${CREATE_ARGS[@]}" >&2
 else
     echo "vCluster '${VCLUSTER_NAME}' already exists (status: ${EXISTING_STATUS}), reusing." >&2
@@ -381,69 +403,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Install NVIDIA GPU Operator inside the tenant's cluster
+# NVIDIA GPU Operator
 #
-# driver.enabled=false: the kernel driver is always managed on the host;
-# a tenant's cluster cannot load kernel modules.
+# When HOST_MANAGED_GPU=true the control plane cluster already runs the GPU
+# stack (the GPU Operator, or a cloud's managed drivers and device plugin).
+# Installing the operator in the tenant's cluster would sync a second device
+# plugin, GFD and toolkit onto the same nodes, so nothing is installed. On
+# Shared Nodes the GPU stack belongs to the platform operator and the tenant
+# can neither see nor replace it, so K8sGpuOperatorNamespaceCheck and
+# K8sGpuOperatorPodsCheck fail here by design (requirement K8S25).
 #
-# When HOST_MANAGED_GPU=true the host already runs a complete GPU Operator
-# stack (device plugin, GFD, toolkit, DCGM).  Installing the same DaemonSets
-# in the tenant would sync duplicate pods onto the host nodes via vCluster,
-# causing double device-plugin registrations and label conflicts.  Instead we
-# create the gpu-operator namespace and a minimal single-pod Deployment.
-# That pod satisfies K8sGpuOperatorNamespaceCheck and K8sGpuOperatorPodsCheck
-# without any host-side interference.  GPU capacity, driver labels, and the
-# nvidia RuntimeClass are already present via sync.fromHost.{nodes,runtimeClasses}.
-#
-# When HOST_MANAGED_GPU=false (no existing GPU Operator on host) we install
-# the full stack with driver.enabled=false.
+# When HOST_MANAGED_GPU=false (no GPU stack on the control plane cluster) the
+# operator is installed with driver.enabled=false: the kernel driver always
+# belongs to the nodes, and a tenant's cluster cannot load kernel modules.
 # ---------------------------------------------------------------------------
 GPU_NODES="$HOST_GPU_NODES"
 
 if [ "$HOST_MANAGED_GPU" = "true" ] && ([ -n "${NGC_API_KEY:-}" ] || [ "${GPU_NODES:-0}" -gt 0 ]); then
-    echo "Host GPU Operator detected; creating gpu-operator namespace and status pod in tenant..." >&2
-    $KUBECTL create namespace gpu-operator --dry-run=client -o yaml 2>/dev/null \
-        | $KUBECTL apply -f - >/dev/null 2>&1
-
-    $KUBECTL apply >/dev/null 2>&1 -f - <<'GOPEOF'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: gpu-operator-controller-manager
-  namespace: gpu-operator
-  labels:
-    app.kubernetes.io/name: gpu-operator
-    app.kubernetes.io/component: controller-manager
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: gpu-operator
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: gpu-operator
-        app.kubernetes.io/component: controller-manager
-    spec:
-      tolerations:
-        - operator: Exists
-      containers:
-        - name: manager
-          image: registry.k8s.io/pause:3.9
-          resources:
-            requests:
-              cpu: "10m"
-              memory: "16Mi"
-            limits:
-              cpu: "100m"
-              memory: "64Mi"
-GOPEOF
-
-    echo "  Waiting for gpu-operator pod to be Running..." >&2
-    $KUBECTL wait deployment gpu-operator-controller-manager \
-        -n gpu-operator --for=condition=Available --timeout=120s >/dev/null 2>&1 \
-        && echo "  GPU Operator status pod Running." >&2 \
-        || echo "  Warning: GPU Operator pod not Ready in 120s; continuing." >&2
+    echo "The control plane cluster manages the GPU stack; not installing the GPU Operator in the tenant's cluster." >&2
 
 elif [ -n "${NGC_API_KEY:-}" ] || [ "${GPU_NODES:-0}" -gt 0 ]; then
     echo "Installing NVIDIA GPU Operator full stack (${GPU_NODES} GPU node(s) found)..." >&2
@@ -591,31 +568,46 @@ if [ -n "${NGC_API_KEY:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Capture LoadBalancer IP for the API network ACL check.
+# API network ACL (K8sApiNetworkAclCheck, requirement K8S15).
 #
-# The tenant kubeconfig already points at the LoadBalancer (via `vcluster
-# connect --expose --print` above), so kubectl reaches the tenant API
-# directly over the LB. We do not restrict loadBalancerSourceRanges here -
-# earlier iterations of this provider used an RFC1918-only restriction plus
-# a localhost port-forward, which proved unreliable for streaming the
-# multi-megabyte conformance JUnit (the kubectl port-forward TCP stream
-# breaks on large `kubectl exec` reads through the GKE API server proxy).
-#
-# Instead, K8sApiNetworkAclCheck verifies the API rejects an unauthenticated
-# request: kubectl with the bound token succeeds, while a raw `curl -f`
-# without credentials gets HTTP 401 (curl exits non-zero). This still proves
-# the API endpoint discriminates between authorized and unauthorized callers
-# at the protocol layer.
+# The tenant's API LoadBalancer admits only VCLUSTER_API_ALLOWED_CIDRS. Apply
+# the allowlist again here so a reused vCluster gets the current one, record
+# the LoadBalancer IP, and write the unauthorized probe: it connects from a pod
+# in the cluster, which is outside the allowlist, and must be blocked. Any
+# HTTP answer, a 401 included, counts as reachable, so an authentication error
+# can never pass for a network ACL.
 # ---------------------------------------------------------------------------
+rm -f /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
 if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
+    _RANGES_JSON=$(python3 -c 'import json, sys; print(json.dumps([c.strip() for c in sys.argv[1].split(",") if c.strip()]))' "$VCLUSTER_API_ALLOWED_CIDRS")
+    kubectl --kubeconfig="${HOST_KUBECONFIG}" -n "${VCLUSTER_NAMESPACE}" patch svc "${VCLUSTER_NAME}" \
+        --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null \
+        && echo "API LoadBalancer restricted to ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
     _ACL_LB_IP=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get svc \
         "${VCLUSTER_NAME}" -n "${VCLUSTER_NAMESPACE}" \
         -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
     if [ -n "$_ACL_LB_IP" ]; then
         echo "vCluster LB IP: ${_ACL_LB_IP}" >&2
         echo "$_ACL_LB_IP" > /tmp/vcluster-isv-lb-ip.txt
+        cat > /tmp/vcluster-isv-acl-probe.sh <<'PROBEEOF'
+#!/usr/bin/env bash
+# Unauthorized probe for K8sApiNetworkAclCheck, written by setup.sh. Connects to
+# the tenant's API LoadBalancer from a pod, which is outside the allowlist.
+# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.
+LB=$(cat /tmp/vcluster-isv-lb-ip.txt 2>/dev/null)
+[ -z "$LB" ] && { echo "no LoadBalancer IP recorded"; exit 127; }
+OUT=$(${KUBECTL:-kubectl} run "acl-probe-$$" --rm -i --restart=Never --quiet \
+    --image=curlimages/curl:8.11.1 --command -- \
+    sh -c "curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" 2>/dev/null)
+case "$OUT" in
+    *" rc=0"*) echo "reachable from a pod: ${OUT}"; exit 0 ;;
+    *" rc=7"* | *" rc=28"*) echo "blocked from a pod: ${OUT}"; exit 1 ;;
+    *) echo "probe failed: ${OUT:-no output}"; exit 127 ;;
+esac
+PROBEEOF
+        chmod +x /tmp/vcluster-isv-acl-probe.sh
     else
-        echo "  Warning: LB IP not available; K8sApiNetworkAclCheck will skip." >&2
+        echo "  Warning: LB IP not available; K8sApiNetworkAclCheck will fail." >&2
     fi
 fi
 

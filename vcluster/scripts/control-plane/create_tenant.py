@@ -86,7 +86,17 @@ def main() -> int:
 
         # Create the tenant (vCluster instance) (--connect=false: no auto port-forward)
         rc, _, stderr = _run(
-            ["vcluster", "create", tenant_name, "--namespace", ns, "--connect=false"],
+            [
+                "vcluster",
+                "create",
+                tenant_name,
+                "--namespace",
+                ns,
+                "--connect=false",
+                # Same pin as scripts/k8s/setup.sh, so the run does not depend on the local CLI version.
+                "--chart-version",
+                os.environ.get("VCLUSTER_VERSION", "0.37.5"),
+            ],
             env,
         )
         if rc != 0:

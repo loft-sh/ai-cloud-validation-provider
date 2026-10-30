@@ -82,6 +82,9 @@ else
     echo "vCluster deleted." >&2
 fi
 
+# Remove the files setup.sh wrote for the API network ACL check
+rm -f /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
+
 # Remove the persisted kubeconfig
 if [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
     rm -f "$VCLUSTER_KUBECONFIG_PATH"
