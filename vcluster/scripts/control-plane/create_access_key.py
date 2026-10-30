@@ -47,6 +47,8 @@ DEMO_MODE = os.environ.get("ISVCTL_DEMO_MODE") == "1"
 
 SA_NAME = "isv-validation-sa"
 TOKEN_DURATION = "1h"
+# Marks a namespace this script created, so delete_access_key.py can remove it again.
+CREATED_BY_LABEL = "ai-cloud-validation/created-by=create_access_key"
 
 
 def _kubeconfig_env() -> dict[str, str]:
@@ -97,6 +99,11 @@ def main() -> int:
             rc_create, _, stderr_create = _run(["kubectl", "create", "namespace", ns], env)
             if rc_create != 0:
                 result["error"] = f"Failed to create namespace '{ns}': {stderr_create}"
+                print(json.dumps(result, indent=2))
+                return 1
+            rc_label, _, stderr_label = _run(["kubectl", "label", "namespace", ns, CREATED_BY_LABEL], env)
+            if rc_label != 0:
+                result["error"] = f"Failed to label namespace '{ns}': {stderr_label}"
                 print(json.dumps(result, indent=2))
                 return 1
 

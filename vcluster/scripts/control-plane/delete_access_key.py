@@ -18,8 +18,9 @@
 """Delete a ServiceAccount (and any associated token secrets) from the cluster.
 
 Teardown counterpart to create_access_key.py. Removes the ServiceAccount from
-the vCluster namespace on the control plane cluster. Kubernetes garbage-collects
-all secrets owned by the SA automatically.
+the vCluster namespace on the control plane cluster, and the namespace itself
+when create_access_key.py created it and it is otherwise empty. Kubernetes
+garbage-collects all secrets owned by the SA automatically.
 
 Required JSON output:
 {
@@ -43,6 +44,9 @@ import sys
 from typing import Any
 
 DEMO_MODE = os.environ.get("ISVCTL_DEMO_MODE") == "1"
+
+# Set by create_access_key.py on a namespace it had to create.
+CREATED_BY_LABEL = "ai-cloud-validation/created-by=create_access_key"
 
 
 def _kubeconfig_env() -> dict[str, str]:
@@ -109,6 +113,36 @@ def main() -> int:
             f"serviceaccount/{args.username}",
             f"clusterrolebinding/{crb_name}",
         ]
+
+        # Remove the namespace as well if create_access_key.py created it and
+        # nothing else (such as a tenant installed there since) lives in it.
+        _, created_ns, _ = _run(
+            [
+                "kubectl",
+                "get",
+                "namespaces",
+                "-l",
+                CREATED_BY_LABEL,
+                "--field-selector",
+                f"metadata.name={ns}",
+                "-o",
+                "name",
+            ],
+            env,
+        )
+        if created_ns:
+            rc_list, contents, _ = _run(["kubectl", "get", "serviceaccounts,pods", "-n", ns, "-o", "name"], env)
+            if rc_list == 0 and not [obj for obj in contents.splitlines() if obj != "serviceaccount/default"]:
+                rc_ns, _, stderr_ns = _run(
+                    ["kubectl", "delete", "namespace", ns, "--ignore-not-found=true", "--timeout=120s"],
+                    env,
+                )
+                if rc_ns != 0:
+                    result["error"] = f"Failed to delete namespace '{ns}': {stderr_ns}"
+                    print(json.dumps(result, indent=2))
+                    return 1
+                result["resources_deleted"].append(f"namespace/{ns}")
+
         result["message"] = (
             f"ServiceAccount '{args.username}' deleted from namespace '{ns}'. "
             "Kubernetes garbage-collected all owned secrets."
