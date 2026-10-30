@@ -102,11 +102,10 @@ deletes the vCluster instance and restores the GPU node taints.
 
 | | |
 |---|---|
-| Control plane cluster | GKE Standard, zonal, Kubernetes 1.36, Calico network policy, GKE-managed NVIDIA drivers on COS |
+| Control plane cluster | GKE Standard, zonal, Kubernetes 1.36, Calico network policy, COS nodes with GKE-managed NVIDIA drivers and device plugin (no GPU Operator) |
 | vCluster | 0.37.5, tenant's cluster on Kubernetes 1.36.6 |
 | `default-pool` | 2x e2-standard-4 |
 | `gpu-t4-pool` | 2x n1-standard-4, 1x NVIDIA T4 16 GB each: GPU, NCCL, stress and NIM workloads |
-| `gpu-a100-pool` | 1x a2-highgpu-1g, 1x NVIDIA A100 40 GB: MIG configuration check |
 
 ## Results
 
@@ -125,20 +124,24 @@ list the results of that run.
   `runtime_class_name: ""`.
 - **GPU Operator.** The GPU stack (the GPU Operator, or on GKE the managed
   drivers and device plugin) belongs to the control plane cluster and its
-  platform operator. Installing the GPU Operator in the tenant's cluster would
-  sync a second device plugin onto the same nodes, so `setup.sh` installs
-  nothing there, and `K8sGpuOperatorNamespaceCheck` and
-  `K8sGpuOperatorPodsCheck` fail by design. When the control plane cluster has
-  no GPU stack, `setup.sh` installs the GPU Operator with `driver.enabled=false`.
+  platform operator. When its nodes already advertise `nvidia.com/gpu`,
+  installing the GPU Operator in the tenant's cluster would sync a second device
+  plugin onto the same nodes, so `setup.sh` installs nothing there, and
+  `K8sGpuOperatorNamespaceCheck` and `K8sGpuOperatorPodsCheck` fail by design.
+  When the control plane cluster has no GPU stack, `setup.sh` installs the GPU
+  Operator with `driver.enabled=false`.
+- **GPU labels.** `K8sGpuLabelsCheck` looks for GPU Feature Discovery's
+  `nvidia.com/gpu.present=true`. GFD does not run on GKE COS, so on GKE the
+  check uses GKE's own GPU node label, `cloud.google.com/gke-accelerator`.
 - **API network ACL.** On cloud clusters the tenant's API server is reachable
   only through a LoadBalancer whose `loadBalancerSourceRanges` admit
   `VCLUSTER_API_ALLOWED_CIDRS`. `K8sApiNetworkAclCheck` requires kubectl from
   the runner to succeed and a request from a pod in the cluster, outside the
   allowlist, to be blocked. Any HTTP answer, a 401 included, counts as
   reachable.
-- **MIG labels.** GPU Feature Discovery does not run on GKE COS, so `setup.sh`
-  labels A100 and H100 nodes `nvidia.com/mig.capable=true` and
-  `nvidia.com/mig.strategy=single`.
+- **MIG.** `setup.sh` adds no `nvidia.com/mig.*` labels of its own. Where GPU
+  Feature Discovery does not run, as on GKE COS, `K8sMigConfigCheck` finds no
+  MIG nodes and skips.
 - **MPI Operator.** `setup.sh` installs the bundled Kubeflow MPI Operator
   v0.5.0 (`manifests/`) with server-side apply for the multi-node NCCL workload.
 - **GPU taints.** `setup.sh` removes `nvidia.com/gpu:NoSchedule` from the GPU

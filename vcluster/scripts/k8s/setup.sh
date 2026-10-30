@@ -199,24 +199,27 @@ done
 # ---------------------------------------------------------------------------
 # Detect host GPU state BEFORE switching kubeconfig
 #
-# We check nvidia.com/gpu.present=true, which is set by GPU Feature Discovery
-# (GFD) only when the GPU Operator's components are fully operational on the
-# host. Cloud-provider labels (cloud.google.com/gke-accelerator, etc.) are
-# intentionally ignored because those labels are present even on nodepools
-# created with gpu-driver-version=disabled where nothing is actually managing
-# the GPU yet.
+# HOST_GFD: nvidia.com/gpu.present=true, set by GPU Feature Discovery when the
+# GPU Operator runs on the control plane cluster.
+# HOST_MANAGED_GPU: the control plane cluster already manages the GPUs, either
+# through the GPU Operator (HOST_GFD) or because its nodes advertise
+# nvidia.com/gpu, meaning a device plugin runs there (for example GKE's own with
+# gpu-driver-version=default). Installing the GPU Operator in the tenant's
+# cluster would then add a second device plugin. Cloud labels such as
+# cloud.google.com/gke-accelerator alone do not count: they are present even
+# when nothing manages the GPUs yet (gpu-driver-version=disabled).
 # ---------------------------------------------------------------------------
-HOST_MANAGED_GPU=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+read -r HOST_GFD HOST_MANAGED_GPU < <(kubectl get nodes -o json 2>/dev/null | python3 -c "
 import json, sys
 try:
     nodes = json.load(sys.stdin).get('items', [])
-    print('true' if any(
-        n.get('metadata', {}).get('labels', {}).get('nvidia.com/gpu.present') == 'true'
-        for n in nodes
-    ) else 'false')
+    gfd = any(n.get('metadata', {}).get('labels', {}).get('nvidia.com/gpu.present') == 'true' for n in nodes)
+    capacity = any(int(n.get('status', {}).get('capacity', {}).get('nvidia.com/gpu', 0) or 0) > 0 for n in nodes)
+    print('true' if gfd else 'false', 'true' if (gfd or capacity) else 'false')
 except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
+    print('false false')
+" 2>/dev/null || echo "false false")
+echo "GPU stack on the control plane cluster: GPU Operator (GFD labels)=${HOST_GFD}, managed=${HOST_MANAGED_GPU}" >&2
 
 HOST_GPU_NODES=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
 import json, sys
@@ -234,57 +237,17 @@ except Exception:
     print(0)
 " 2>/dev/null | tr -d '[:space:]' || echo "0")
 
-# ---------------------------------------------------------------------------
-# Label A100 (MIG-capable) GPU nodes with nvidia.com/mig.capable=true if the
-# label is missing.  On GKE COS, GFD (GPU Feature Discovery) cannot start
-# because the nvidia container runtime is not registered in containerd; the
-# native GKE device plugin handles GPU scheduling instead.  We set the label
-# manually here so that K8sMigConfigCheck can verify MIG-capable hardware is
-# present in the tenant's cluster (the label is synced via sync.fromHost.nodes).
-# ---------------------------------------------------------------------------
-echo "Checking for MIG-capable GPU nodes (A100/H100)..." >&2
-kubectl get nodes -o json 2>/dev/null | python3 -c "
-import json, sys, subprocess
-try:
-    nodes = json.load(sys.stdin).get('items', [])
-    for n in nodes:
-        labels = n.get('metadata', {}).get('labels', {})
-        # GKE sets gke-accelerator label for A100/H100; GFD is expected to set
-        # nvidia.com/mig.capable and nvidia.com/mig.strategy labels but cannot
-        # on GKE COS (no nvidia container runtime). Apply both labels manually
-        # so K8sMigConfigCheck's expected_labels assertion passes when the
-        # node syncs into the tenant's cluster.
-        accel = labels.get('cloud.google.com/gke-accelerator', '')
-        is_mig_hw = any(x in accel for x in ['a100', 'h100', 'a30'])
-        if not is_mig_hw:
-            continue
-        name = n['metadata']['name']
-        wanted = {
-            'nvidia.com/mig.capable': 'true',
-            # Default MIG strategy; setup leaves MIG disabled at hardware level
-            # (no instance partitioning) but advertises the label so the ISV
-            # suite can verify the platform exposes the metadata.
-            'nvidia.com/mig.strategy': 'single',
-        }
-        missing = [f'{k}={v}' for k, v in wanted.items() if labels.get(k) != v]
-        if missing:
-            subprocess.run(
-                ['kubectl', 'label', 'node', name, *missing, '--overwrite'],
-                capture_output=True,
-            )
-            print(f'  Labeled {name} ({accel}) with {missing}', file=sys.stderr)
-except Exception as e:
-    print(f'  Warning: MIG label check failed: {e}', file=sys.stderr)
-" 2>&1 >&2 || true
+# MIG: GPU Feature Discovery publishes the nvidia.com/mig.* labels where it runs
+# and MIG is configured. setup.sh does not add them itself, so where GFD does
+# not run (GKE COS) K8sMigConfigCheck finds no MIG nodes and skips.
 
 # ---------------------------------------------------------------------------
-# When the host already has a running GPU Operator (nvidia.com/gpu.present=true),
-# ensure the 'nvidia' RuntimeClass exists on the host so vCluster can sync it
-# into the tenant's cluster via sync.fromHost.runtimeClasses.enabled=true.
-# Some providers (e.g. GKE) configure containerd with the nvidia runtime handler
-# but do not create the RuntimeClass Kubernetes object; we create it here.
+# When the GPU Operator runs on the control plane cluster (HOST_GFD), its
+# toolkit registers the nvidia runtime handler in containerd; make sure the
+# matching 'nvidia' RuntimeClass object exists there too. A cloud-managed device
+# plugin (GKE COS) registers no such handler, so nothing is created then.
 # ---------------------------------------------------------------------------
-if [ "$HOST_MANAGED_GPU" = "true" ]; then
+if [ "$HOST_GFD" = "true" ]; then
     if ! kubectl get runtimeclass nvidia &>/dev/null; then
         echo "Creating 'nvidia' RuntimeClass on host (handler exists in containerd but object was missing)..." >&2
         kubectl apply -f - >&2 <<'RCEOF'
@@ -651,6 +614,9 @@ k8s['runtime_class'] = ''
 # not published on GKE COS nodes so the version resolves to 'unknown'.
 # Always clear so K8sDriverVersionCheck skips the comparison on GKE.
 k8s['driver_version'] = ''
+# GKE's own GPU node label: GPU Feature Discovery (nvidia.com/gpu.present) does
+# not run on GKE COS nodes.
+k8s['gpu_label_selector'] = 'cloud.google.com/gke-accelerator'
 print(json.dumps(data, indent=2))
 "
 else

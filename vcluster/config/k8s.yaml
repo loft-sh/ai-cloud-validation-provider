@@ -127,6 +127,12 @@ tests:
 
     kubernetes:
       checks:
+        K8sGpuLabelsCheck:
+          # GPU Feature Discovery's nvidia.com/gpu.present label exists only
+          # where GFD runs. On GKE COS setup.sh reports GKE's own GPU node label
+          # (cloud.google.com/gke-accelerator) instead.
+          label_selector: "{{ steps.setup.kubernetes.gpu_label_selector | default('nvidia.com/gpu.present=true') }}"
+
         K8sDriverVersionCheck:
           # GKE manages GPU drivers natively; GFD labels (nvidia.com/cuda.driver.*)
           # are not set on GKE COS nodes, so setup.sh cannot determine the driver
