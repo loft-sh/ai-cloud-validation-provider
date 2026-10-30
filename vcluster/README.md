@@ -180,8 +180,9 @@ environment):
 | Skipped | MigConfig (no MIG GPUs), DualStackNode (single-stack nodes), ClusterAutoscaler (none installed) |
 | Not configured | The 15 checks whose steps are not wired; see Known gaps |
 
-**CNCF conformance**: a full run passed 441 of 442 specs; its one failure,
-"deny attaching pod", is skipped since (see [CNCF conformance](#cncf-conformance)).
+**CNCF conformance**: all 441 specs passed, with the two skips described in
+[CNCF conformance](#cncf-conformance). An earlier full run without the "deny
+attaching pod" skip passed 441 of 442.
 
 ## How the provider runs the `k8s` suite
 
