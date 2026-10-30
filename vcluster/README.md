@@ -63,7 +63,7 @@ to a stable range, such as your office or VPN egress.
 | `NGC_API_KEY` | `k8s` suite | | NGC API key for nvcr.io pulls and the NIM workloads |
 | `VCLUSTER_VERSION` | no | `0.37.5` | vCluster chart version that `setup.sh` and `create_tenant.py` deploy |
 | `VCLUSTER_DRIVER` | no | `helm` | vcluster CLI driver; `helm` deploys into the control plane cluster even if your CLI defaults to Docker |
-| `VCLUSTER_NAME` | no | `vcluster-isv-validation` | Name of the vCluster instance |
+| `VCLUSTER_NAME` | no | `acv-tenant` | Name of the vCluster instance. Keep it at 14 characters or less (see [CNCF conformance](#cncf-conformance)) |
 | `VCLUSTER_NAMESPACE` | no | `vcluster-isv-validation` | Its namespace on the control plane cluster |
 | `VCLUSTER_KUBECONFIG_PATH` | no | `/tmp/vcluster-isv-validation.kubeconfig` | Where `setup.sh` writes the tenant's kubeconfig |
 | `VCLUSTER_EXPOSE` | no | auto-detected | `true` exposes the tenant's API server through a LoadBalancer |
@@ -165,7 +165,11 @@ list the results of that run.
   [CNCF-certified Shared Nodes configuration](https://github.com/cncf/k8s-conformance/tree/master/v1.36/vcluster-with-shared-nodes)
   (virtual scheduler, chart-deployed etcd, real node addresses,
   PersistentVolume, PriorityClass and StorageClass sync) and adds what GPU workloads need: node sync with all
-  labels and capacity, NetworkPolicy sync, and an `nvidia` RuntimeClass.
+  labels and capacity, NetworkPolicy sync, and an `nvidia` RuntimeClass. The
+  tenant's API server runs with `--enable-aggregator-routing=true`, so it calls
+  webhooks and aggregated APIs on their endpoint IPs, as managed control planes
+  do, instead of on Service ClusterIPs that the control plane cluster's
+  kube-proxy may not have programmed yet.
 - **GPU access.** On GKE COS nodes containerd has no `nvidia` runtime handler,
   so GPU pods only request `nvidia.com/gpu` and the workloads set
   `runtime_class_name: ""`.
@@ -200,14 +204,16 @@ list the results of that run.
   schedulable. `teardown.sh` restores the taints.
 - **Access keys.** An access key is a ServiceAccount with a bound token.
   Disabling it removes its ClusterRoleBinding, so the token gets 403. Deleting
-  it removes both.
+  it removes both, and the `VCLUSTER_NAMESPACE` namespace too when
+  `create_access_key.py` had to create it and nothing else lives there.
 
 ## Known gaps against the 1.0.0 suites
 
 - **GPU Operator (K8S25-01, K8S25-02).** On Shared Nodes the GPU Operator and
-  driver belong to the platform operator, so a tenant can neither see nor
-  replace them. The namespace and pod checks fail; the override check skips
-  because `setup.sh` reports no driver version on GKE.
+  driver belong to the platform operator on the control plane cluster, so a
+  tenant can neither see nor replace them. The namespace, pod and override
+  checks fail: the tenant's cluster has no GPU Operator workloads and no
+  ClusterPolicy or NVIDIADriver to override.
 - **OIDC issuer (K8S17-02).** The check fetches the OIDC discovery document and
   JWKS anonymously from outside the cluster. The tenant's cluster advertises an
   in-cluster issuer, so the check fails unless the issuer is published at a
@@ -226,9 +232,18 @@ list the results of that run.
 
 ## CNCF conformance
 
-`K8sCncfConformanceCheck` runs in `certified-conformance` mode. Any test
-skipped in `config/k8s.yaml` (`e2e_skip`) is listed there with the reason it
-fails on this setup. vCluster is
+`K8sCncfConformanceCheck` runs in `certified-conformance` mode. A run with no
+skips on the reference environment ran 443 `[Conformance]` specs: 439 passed and
+4 failed. `config/k8s.yaml` skips one of them, for a vCluster bug, and the
+provider's configuration fixes the other three:
+
+| Failing spec | Cause | Handling |
+|---|---|---|
+| Pod Generation: 500 podspec updates, `observedGeneration` converges | vCluster 0.37.5 copies the host pod's `status.observedGeneration` into the tenant's pod. The syncer folds rapid updates together, so the host pod ends at generation 490 while the tenant's pod is at 500, and the values never converge | Skipped |
+| EndpointSlice: multiple endpoint IPs, and multiple ports, in multiple EndpointSlices | vCluster 0.37.5 builds the host EndpointSlice's `kubernetes.io/service-name` label without the hashing it applies to host Service names over 63 characters. With a long tenant name the label is invalid and the selector-less Service gets no endpoints | Pass with the default `VCLUSTER_NAME`, `acv-tenant`. Keep it at 14 characters or less |
+| CustomResourceConversionWebhook (either spec, intermittently) | The tenant's API server called the new webhook Service by ClusterIP before the control plane cluster's kube-proxy had programmed it (GKE resyncs at most every 10 s), and the blackholed connection outlasted the spec's 30 s wait | `--enable-aggregator-routing=true` (see above) |
+
+vCluster is
 [CNCF-certified](https://github.com/cncf/k8s-conformance/tree/master/v1.36) for
 Kubernetes 1.28 through 1.36; the 1.35 and 1.36 certifications cover standalone,
 Private Nodes and Shared Nodes configurations.

@@ -30,7 +30,8 @@
 #   VCLUSTER_VERSION         - vCluster chart version to deploy (default: 0.37.5)
 #   VCLUSTER_DRIVER          - vcluster CLI driver (default: helm, so a CLI configured
 #                              for Docker still deploys into the control plane cluster)
-#   VCLUSTER_NAME            - tenant's cluster name (default: vcluster-isv-validation)
+#   VCLUSTER_NAME            - tenant's cluster name (default: acv-tenant; keep it at
+#                              14 characters or less, see config/k8s.yaml)
 #   VCLUSTER_NAMESPACE       - host namespace      (default: vcluster-isv-validation)
 #   VCLUSTER_KUBECONFIG_PATH - where to write the tenant kubeconfig
 #                              (default: /tmp/vcluster-isv-validation.kubeconfig)
@@ -60,7 +61,7 @@ done
 
 VCLUSTER_VERSION="${VCLUSTER_VERSION:-0.37.5}"
 VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-helm}"
-VCLUSTER_NAME="${VCLUSTER_NAME:-vcluster-isv-validation}"
+VCLUSTER_NAME="${VCLUSTER_NAME:-acv-tenant}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
@@ -167,6 +168,12 @@ if [ -z "$EXISTING_STATUS" ]; then
         --set networking.advanced.proxyKubelets.byIP=false
         # Service account issuer discovery advertises the in-cluster API address.
         --set 'controlPlane.distro.k8s.apiServer.extraArgs[0]=--service-account-jwks-uri=https://kubernetes.default.svc.cluster.local/openid/v1/jwks'
+        # Call admission and conversion webhooks and aggregated APIs on their
+        # endpoint IPs, as managed control planes do. Through the Service
+        # ClusterIP, a webhook created moments earlier is unreachable until the
+        # control plane cluster's kube-proxy programs it (GKE resyncs at most
+        # every 10 s), and conntrack keeps that first connection blackholed.
+        --set 'controlPlane.distro.k8s.apiServer.extraArgs[1]=--enable-aggregator-routing=true'
         --set sync.toHost.persistentVolumes.enabled=true
         --set sync.toHost.priorityClasses.enabled=true
         --set sync.toHost.storageClasses.enabled=true

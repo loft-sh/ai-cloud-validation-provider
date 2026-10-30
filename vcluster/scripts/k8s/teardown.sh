@@ -20,14 +20,14 @@
 #
 # Environment variables:
 #   VCLUSTER_DRIVER           - vcluster CLI driver (default: helm)
-#   VCLUSTER_NAME             - name of the tenant's cluster (default: vcluster-isv-validation)
+#   VCLUSTER_NAME             - name of the tenant's cluster (default: acv-tenant)
 #   VCLUSTER_NAMESPACE        - namespace on the control plane cluster (default: vcluster-isv-validation)
 #   VCLUSTER_KUBECONFIG_PATH  - persisted kubeconfig path to remove (default: /tmp/vcluster-isv-validation.kubeconfig)
 
 set -eo pipefail
 
 VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-helm}"
-VCLUSTER_NAME="${VCLUSTER_NAME:-vcluster-isv-validation}"
+VCLUSTER_NAME="${VCLUSTER_NAME:-acv-tenant}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
 GPU_TAINT_STATE_FILE="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}-gpu-taints.txt"
