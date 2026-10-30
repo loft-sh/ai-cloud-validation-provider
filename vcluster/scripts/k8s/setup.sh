@@ -65,6 +65,13 @@ VCLUSTER_NAME="${VCLUSTER_NAME:-acv-tenant}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
+# vCluster 0.37.5 builds the host EndpointSlice service-name label as
+# <service>-x-<namespace>-x-<name> without hashing it past 63 characters, so a
+# longer name breaks selector-less Services (two CNCF conformance specs).
+if [ "${#VCLUSTER_NAME}" -gt 14 ]; then
+    echo "Error: VCLUSTER_NAME '${VCLUSTER_NAME}' is longer than 14 characters; see config/k8s.yaml." >&2
+    exit 1
+fi
 # Save host kubeconfig before we switch KUBECONFIG to the tenant's cluster below.
 HOST_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 # State file for taint restoration at teardown.
@@ -76,7 +83,7 @@ GPU_TAINT_STATE_FILE="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}-gpu-taints.txt"
 # during long runs (CNCF conformance ~2 hours); LoadBalancer exposure gives a
 # stable endpoint that survives the full suite.
 # ---------------------------------------------------------------------------
-if [ -z "${VCLUSTER_EXPOSE:-}" ]; then
+if [ -z "${CLOUD_PROVIDER:-}" ]; then
     CLOUD_PROVIDER=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
 import json, sys
 try:
@@ -87,10 +94,10 @@ try:
     else: print('')
 except Exception: print('')
 " 2>/dev/null || echo "")
-    if [ -n "$CLOUD_PROVIDER" ]; then
-        echo "Detected cloud provider: ${CLOUD_PROVIDER}. Enabling LoadBalancer exposure." >&2
-        VCLUSTER_EXPOSE="true"
-    fi
+fi
+if [ -z "${VCLUSTER_EXPOSE:-}" ] && [ -n "$CLOUD_PROVIDER" ]; then
+    echo "Detected cloud provider: ${CLOUD_PROVIDER}. Enabling LoadBalancer exposure." >&2
+    VCLUSTER_EXPOSE="true"
 fi
 
 # ---------------------------------------------------------------------------
@@ -109,6 +116,8 @@ if [ "${VCLUSTER_EXPOSE:-false}" = "true" ] && [ -z "$VCLUSTER_API_ALLOWED_CIDRS
     fi
     VCLUSTER_API_ALLOWED_CIDRS="${_RUNNER_IP}/32"
 fi
+# Normalize the list: no spaces, no empty entries (a trailing comma breaks the chart).
+VCLUSTER_API_ALLOWED_CIDRS=$(python3 -c 'import sys; print(",".join(c.strip() for c in sys.argv[1].split(",") if c.strip()))' "$VCLUSTER_API_ALLOWED_CIDRS")
 [ "${VCLUSTER_EXPOSE:-false}" = "true" ] && echo "API LoadBalancer allowlist: ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
 
 # ---------------------------------------------------------------------------
@@ -186,6 +195,15 @@ if [ -z "$EXISTING_STATUS" ]; then
     vcluster create "${CREATE_ARGS[@]}" >&2
 else
     echo "vCluster '${VCLUSTER_NAME}' already exists (status: ${EXISTING_STATUS}), reusing." >&2
+fi
+
+# A reused vCluster keeps the allowlist it was created with: apply the current
+# one before anything connects through the LoadBalancer.
+if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
+    _RANGES_JSON=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1].split(",")))' "$VCLUSTER_API_ALLOWED_CIDRS")
+    kubectl --kubeconfig="${HOST_KUBECONFIG}" -n "${VCLUSTER_NAMESPACE}" patch svc "${VCLUSTER_NAME}" \
+        --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null \
+        && echo "API LoadBalancer restricted to ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -279,11 +297,16 @@ fi
 # point to the LoadBalancer IP; otherwise it points to the local port-forward.
 # ---------------------------------------------------------------------------
 echo "Connecting to vCluster, saving kubeconfig to ${VCLUSTER_KUBECONFIG_PATH}..." >&2
-vcluster connect "$VCLUSTER_NAME" \
-    --driver "$VCLUSTER_DRIVER" \
-    --namespace "$VCLUSTER_NAMESPACE" \
-    --print \
-    2>/dev/null > "$VCLUSTER_KUBECONFIG_PATH"
+# The kubeconfig holds the tenant's admin credentials: owner-only permissions.
+(
+    umask 077
+    vcluster connect "$VCLUSTER_NAME" \
+        --driver "$VCLUSTER_DRIVER" \
+        --namespace "$VCLUSTER_NAMESPACE" \
+        --print \
+        2>/dev/null > "$VCLUSTER_KUBECONFIG_PATH"
+)
+chmod 600 "$VCLUSTER_KUBECONFIG_PATH"
 
 export KUBECONFIG="$VCLUSTER_KUBECONFIG_PATH"
 KUBECTL="kubectl"
@@ -347,7 +370,8 @@ done
 # conformance e2e BeforeSuite sees all synced nodes as schedulable.
 # vCluster propagates host node spec changes into the tenant on the next sync
 # cycle, so removing the taint here ensures conformance can schedule its pods.
-# The node names are saved to GPU_TAINT_STATE_FILE so teardown.sh can restore.
+# Each node and its taint value (GKE uses nvidia.com/gpu=present:NoSchedule)
+# are saved to GPU_TAINT_STATE_FILE so teardown.sh restores the exact taint.
 # ---------------------------------------------------------------------------
 GPU_TAINT_NODES=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get nodes \
     -o json 2>/dev/null | python3 -c "
@@ -355,10 +379,10 @@ import json, sys
 try:
     nodes = json.load(sys.stdin).get('items', [])
     for n in nodes:
-        taints = n.get('spec', {}).get('taints', []) or []
-        if any(t.get('key') == 'nvidia.com/gpu' and t.get('effect') == 'NoSchedule'
-               for t in taints):
-            print(n['metadata']['name'])
+        for t in n.get('spec', {}).get('taints', []) or []:
+            if t.get('key') == 'nvidia.com/gpu' and t.get('effect') == 'NoSchedule':
+                print(n['metadata']['name'] + '\t' + t.get('value', ''))
+                break
 except Exception:
     pass
 " 2>/dev/null || echo "")
@@ -366,7 +390,7 @@ except Exception:
 if [ -n "$GPU_TAINT_NODES" ]; then
     echo "Temporarily removing nvidia.com/gpu:NoSchedule from host nodes for CNCF conformance..." >&2
     printf '%s\n' "$GPU_TAINT_NODES" > "$GPU_TAINT_STATE_FILE"
-    while IFS= read -r node; do
+    while IFS=$'\t' read -r node _value; do
         # Redirect stdout too: kubectl taint writes "node/X untainted" to stdout
         # which would corrupt the JSON inventory emitted by _common.sh later.
         if kubectl --kubeconfig="${HOST_KUBECONFIG}" taint node "$node" \
@@ -431,7 +455,10 @@ elif [ -n "${NGC_API_KEY:-}" ] || [ "${GPU_NODES:-0}" -gt 0 ]; then
     # signal or non-zero exit between mktemp and the explicit rm would
     # otherwise leak the secret on disk.
     _cleanup_helm_values_file() {
-        [ -n "${_HELM_VALUES_FILE:-}" ] && rm -f "$_HELM_VALUES_FILE"
+        # if/fi, not &&: a failed test would return 1 and trip set -e.
+        if [ -n "${_HELM_VALUES_FILE:-}" ]; then
+            rm -f "$_HELM_VALUES_FILE"
+        fi
     }
     trap _cleanup_helm_values_file EXIT
     if [ -n "${NGC_API_KEY:-}" ]; then
@@ -548,44 +575,58 @@ fi
 # ---------------------------------------------------------------------------
 # API network ACL (K8sApiNetworkAclCheck, requirement K8S15).
 #
-# The tenant's API LoadBalancer admits only VCLUSTER_API_ALLOWED_CIDRS. Apply
-# the allowlist again here so a reused vCluster gets the current one, record
-# the LoadBalancer IP, and write the unauthorized probe: it connects from a pod
-# in the cluster, which is outside the allowlist, and must be blocked. Any
-# HTTP answer, a 401 included, counts as reachable, so an authentication error
-# can never pass for a network ACL.
+# The tenant's API LoadBalancer admits only VCLUSTER_API_ALLOWED_CIDRS (applied
+# above). Write the unauthorized probe next to the tenant's kubeconfig: it
+# connects from a pod in the cluster, which is outside the allowlist, and must
+# be blocked. Any HTTP answer, a 401 included, counts as reachable, so an
+# authentication error can never pass for a network ACL. The probe bounds its
+# own run time well inside the check's probe_timeout_s and exits 127 on any
+# failure of its own, so a hang can never pass as "blocked".
 # ---------------------------------------------------------------------------
-rm -f /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
+ACL_PROBE="${VCLUSTER_KUBECONFIG_PATH}.acl-probe.sh"
+rm -f "$ACL_PROBE" /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
 if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
-    _RANGES_JSON=$(python3 -c 'import json, sys; print(json.dumps([c.strip() for c in sys.argv[1].split(",") if c.strip()]))' "$VCLUSTER_API_ALLOWED_CIDRS")
-    kubectl --kubeconfig="${HOST_KUBECONFIG}" -n "${VCLUSTER_NAMESPACE}" patch svc "${VCLUSTER_NAME}" \
-        --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null \
-        && echo "API LoadBalancer restricted to ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
-    _ACL_LB_IP=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get svc \
+    # Clouds publish an IP (GKE, AKS) or a hostname (AWS load balancers).
+    _ACL_LB=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get svc \
         "${VCLUSTER_NAME}" -n "${VCLUSTER_NAMESPACE}" \
-        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-    if [ -n "$_ACL_LB_IP" ]; then
-        echo "vCluster LB IP: ${_ACL_LB_IP}" >&2
-        echo "$_ACL_LB_IP" > /tmp/vcluster-isv-lb-ip.txt
-        cat > /tmp/vcluster-isv-acl-probe.sh <<'PROBEEOF'
-#!/usr/bin/env bash
-# Unauthorized probe for K8sApiNetworkAclCheck, written by setup.sh. Connects to
-# the tenant's API LoadBalancer from a pod, which is outside the allowlist.
-# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.
-LB=$(cat /tmp/vcluster-isv-lb-ip.txt 2>/dev/null)
-[ -z "$LB" ] && { echo "no LoadBalancer IP recorded"; exit 127; }
-OUT=$(${KUBECTL:-kubectl} run "acl-probe-$$" --rm -i --restart=Never --quiet \
-    --image=curlimages/curl:8.11.1 --command -- \
-    sh -c "curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" 2>/dev/null)
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    if [ -n "$_ACL_LB" ]; then
+        echo "vCluster LoadBalancer: ${_ACL_LB}" >&2
+        (
+            umask 077
+            {
+                echo '#!/usr/bin/env bash'
+                echo '# Unauthorized probe for K8sApiNetworkAclCheck, written by setup.sh. Connects to'
+                echo "# the tenant's API LoadBalancer from a pod, which is outside the allowlist."
+                echo '# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.'
+                printf 'LB=%q\n' "$_ACL_LB"
+                cat <<'PROBEEOF'
+K=${KUBECTL:-kubectl}
+POD="acl-probe-$$"
+# shellcheck disable=SC2086 # KUBECTL may carry flags such as --kubeconfig
+if ! $K run "$POD" --restart=Never --image=curlimages/curl:8.11.1 --request-timeout=15s --command -- \
+        sh -c "curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" >/dev/null 2>&1; then
+    echo "probe failed: could not create pod ${POD}"; exit 127
+fi
+OUT=""
+# shellcheck disable=SC2086
+if $K wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${POD}" --timeout=60s >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    OUT=$($K logs "$POD" --request-timeout=10s 2>/dev/null)
+fi
+# shellcheck disable=SC2086
+$K delete pod "$POD" --ignore-not-found --wait=false --request-timeout=10s >/dev/null 2>&1
 case "$OUT" in
     *" rc=0"*) echo "reachable from a pod: ${OUT}"; exit 0 ;;
     *" rc=7"* | *" rc=28"*) echo "blocked from a pod: ${OUT}"; exit 1 ;;
-    *) echo "probe failed: ${OUT:-no output}"; exit 127 ;;
+    *) echo "probe failed: ${OUT:-no result within the time limit}"; exit 127 ;;
 esac
 PROBEEOF
-        chmod +x /tmp/vcluster-isv-acl-probe.sh
+            } > "$ACL_PROBE"
+        )
+        chmod 700 "$ACL_PROBE"
     else
-        echo "  Warning: LB IP not available; K8sApiNetworkAclCheck will fail." >&2
+        echo "  Warning: LoadBalancer address not available; K8sApiNetworkAclCheck will fail." >&2
     fi
 fi
 
@@ -604,7 +645,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # runtimeClassName: nvidia; without the GPU Operator's toolkit containerd has no
 # nvidia handler at all. Without the GPU Operator (HOST_GFD=false), GPU Feature
 # Discovery does not run either, so there are no driver labels to read a version
-# from, and GPU nodes carry GKE's own label instead of nvidia.com/gpu.present.
+# from: the inventory reports none and K8sDriverVersionCheck does not compare.
+# The NVIDIA-label checks are left to fail; nothing stands in for GFD's labels.
 if [ "${CLOUD_PROVIDER:-}" = "gke" ]; then
     _COMMON_JSON=$(
         CLUSTER_NAME="$CLUSTER_NAME"
@@ -619,9 +661,8 @@ data = json.load(sys.stdin)
 k8s = data.setdefault('kubernetes', {})
 k8s['runtime_class'] = ''
 if os.environ.get('HOST_GFD') != 'true':
-    # K8sDriverVersionCheck skips without a version; K8sGpuLabelsCheck uses GKE's label.
+    # No GFD driver labels: report no version rather than the runner's own.
     k8s['driver_version'] = ''
-    k8s['gpu_label_selector'] = 'cloud.google.com/gke-accelerator'
 print(json.dumps(data, indent=2))
 "
 else

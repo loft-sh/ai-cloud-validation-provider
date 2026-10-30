@@ -69,7 +69,7 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="Region label (use 'vcluster')")
     args = parser.parse_args()  # noqa: F841
 
-    ns = os.environ.get("VCLUSTER_NAMESPACE", "vcluster-isv-validation")
+    ns = os.environ.get("VCLUSTER_NAMESPACE") or "vcluster-isv-validation"
     sa_name = f"{SA_NAME}-{int(time.time())}"
 
     result: dict[str, Any] = {

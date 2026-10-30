@@ -1,10 +1,11 @@
 name: Validate against ai-cloud-validation
 
-# Loads every provider config against the latest ai-cloud-validation release
-# with --dry-run, the check NVIDIA's registry CI runs on registered entries:
-# the configs must load against the current suites. No provider script runs,
-# so no cluster or credentials are needed. The weekly run catches a new
-# release changing the suite contract.
+# Loads every provider config with --dry-run against the latest
+# ai-cloud-validation release and against its main branch, the check NVIDIA's
+# registry CI runs on registered entries (its weekly job uses main): the
+# configs must load against the current suites. No provider script runs, so no
+# cluster or credentials are needed. The weekly run catches a release or a
+# change on main altering the suite contract.
 on:
   push:
     branches: [main]
@@ -37,7 +38,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   dry-run:
-    name: ${{ matrix.provider }} ${{ matrix.suite }}
+    name: ${{ matrix.provider }} ${{ matrix.suite }} (${{ matrix.ref }})
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -46,11 +47,12 @@ jobs:
       matrix:
         provider: [vcluster]
         suite: [k8s, control-plane]
+        ref: [release, main]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NVIDIA/ai-cloud-validation
-          ref: ${{ needs.release.outputs.tag }}
+          ref: ${{ matrix.ref == 'main' && 'main' || needs.release.outputs.tag }}
           path: validation
           persist-credentials: false
 

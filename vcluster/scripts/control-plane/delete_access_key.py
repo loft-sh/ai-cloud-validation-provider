@@ -69,7 +69,7 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="Region label (use 'vcluster')")
     args = parser.parse_args()
 
-    ns = os.environ.get("VCLUSTER_NAMESPACE", "vcluster-isv-validation")
+    ns = os.environ.get("VCLUSTER_NAMESPACE") or "vcluster-isv-validation"
 
     result: dict[str, Any] = {
         "success": False,
@@ -131,10 +131,12 @@ def main() -> int:
             env,
         )
         if created_ns:
-            rc_list, contents, _ = _run(["kubectl", "get", "serviceaccounts,pods", "-n", ns, "-o", "name"], env)
+            rc_list, contents, _ = _run(
+                ["kubectl", "get", "serviceaccounts,pods,services,persistentvolumeclaims", "-n", ns, "-o", "name"], env
+            )
             if rc_list == 0 and not [obj for obj in contents.splitlines() if obj != "serviceaccount/default"]:
                 rc_ns, _, stderr_ns = _run(
-                    ["kubectl", "delete", "namespace", ns, "--ignore-not-found=true", "--timeout=120s"],
+                    ["kubectl", "delete", "namespace", ns, "--ignore-not-found=true", "--wait=false"],
                     env,
                 )
                 if rc_ns != 0:

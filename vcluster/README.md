@@ -63,9 +63,9 @@ to a stable range, such as your office or VPN egress.
 | `NGC_API_KEY` | `k8s` suite | | NGC API key for nvcr.io pulls and the NIM workloads |
 | `VCLUSTER_VERSION` | no | `0.37.5` | vCluster chart version that `setup.sh` and `create_tenant.py` deploy |
 | `VCLUSTER_DRIVER` | no | `helm` | vcluster CLI driver; `helm` deploys into the control plane cluster even if your CLI defaults to Docker |
-| `VCLUSTER_NAME` | no | `acv-tenant` | Name of the vCluster instance. Keep it at 14 characters or less (see [CNCF conformance](#cncf-conformance)) |
+| `VCLUSTER_NAME` | no | `acv-tenant` | Name of the vCluster instance, at most 14 characters; `setup.sh` rejects longer names (see [CNCF conformance](#cncf-conformance)) |
 | `VCLUSTER_NAMESPACE` | no | `vcluster-isv-validation` | Its namespace on the control plane cluster |
-| `VCLUSTER_KUBECONFIG_PATH` | no | `/tmp/vcluster-isv-validation.kubeconfig` | Where `setup.sh` writes the tenant's kubeconfig |
+| `VCLUSTER_KUBECONFIG_PATH` | no | `/tmp/vcluster-isv-validation.kubeconfig` | Where `setup.sh` writes the tenant's kubeconfig (mode 600) and, next to it, the ACL probe. On a shared machine, point it at a private directory |
 | `VCLUSTER_EXPOSE` | no | auto-detected | `true` exposes the tenant's API server through a LoadBalancer |
 | `VCLUSTER_API_ALLOWED_CIDRS` | no | this machine's public IPv4 `/32` | Comma-separated CIDRs the API LoadBalancer admits |
 | `CLOUD_PROVIDER` | no | auto-detected | `gke` enables the GKE GPU handling described below |
@@ -74,32 +74,39 @@ to a stable range, such as your office or VPN egress.
 
 ## Reproducing
 
-Run from an ai-cloud-validation checkout at the release the registry entry
-names in `tested_with`:
+The results below were produced against ai-cloud-validation v1.0.0, the
+release the registry entry names in `tested_with`. That tag predates the
+`vcluster` registry entry, so clone this repository next to it and pass the
+config path, from the checkout root:
 
 ```bash
 git clone --branch v1.0.0 https://github.com/NVIDIA/ai-cloud-validation.git
+git clone https://github.com/loft-sh/ai-cloud-validation-provider.git
 cd ai-cloud-validation
 uv sync
-uv run isvctl provider fetch vcluster   # checks out the registered commit
 export KUBECONFIG=/path/to/control-plane-cluster.kubeconfig
 
-uv run isvctl test run --provider vcluster --suite control-plane
+uv run isvctl test run -f ../ai-cloud-validation-provider/vcluster/config/control-plane.yaml
 
 NGC_API_KEY="$(cat /path/to/ngc-api-key)" \
 KUBECTL="kubectl --kubeconfig=/tmp/vcluster-isv-validation.kubeconfig" \
-  uv run isvctl test run --provider vcluster --suite k8s
+  uv run isvctl test run -f ../ai-cloud-validation-provider/vcluster/config/k8s.yaml
 ```
 
-Before the registry entry exists, clone this repository next to the checkout
-and pass the config path instead of `--provider`, from the checkout root:
+From a checkout that contains the registry entry (`main` once
+[NVIDIA/ai-cloud-validation#414](https://github.com/NVIDIA/ai-cloud-validation/pull/414)
+merges, and releases after it), fetch the registered commit and run it by name
+instead:
 
 ```bash
-uv run isvctl test run -f ../ai-cloud-validation-provider/vcluster/config/control-plane.yaml
+uv run isvctl provider fetch vcluster
+uv run isvctl test run --provider vcluster --suite control-plane
+uv run isvctl test run --provider vcluster --suite k8s   # with NGC_API_KEY and KUBECTL as above
 ```
 
 Add `--phase setup|test|teardown` to run one phase of the `k8s` suite. Teardown
-deletes the vCluster instance and restores the GPU node taints.
+deletes the vCluster instance and restores the GPU node taints exactly as they
+were.
 
 ### Reference environment
 
@@ -182,18 +189,28 @@ list the results of that run.
   When the control plane cluster has no GPU stack, `setup.sh` installs the GPU
   Operator with `driver.enabled=false`.
 - **GPU labels and driver version.** The suite finds GPU nodes by GPU Feature
-  Discovery's `nvidia.com/gpu.present=true` label and reads the driver version
-  from GFD's `nvidia.com/cuda.driver.*` labels, so the reference environment
-  runs the GPU Operator. On GKE without it, `setup.sh` points
-  `K8sGpuLabelsCheck` at GKE's own `cloud.google.com/gke-accelerator` label and
-  reports no driver version, which makes `K8sDriverVersionCheck` skip; GPU node
-  discovery in `K8sGpuPodAccessCheck` still needs GFD.
-- **API network ACL.** On cloud clusters the tenant's API server is reachable
-  only through a LoadBalancer whose `loadBalancerSourceRanges` admit
-  `VCLUSTER_API_ALLOWED_CIDRS`. `K8sApiNetworkAclCheck` requires kubectl from
-  the runner to succeed and a request from a pod in the cluster, outside the
-  allowlist, to be blocked. Any HTTP answer, a 401 included, counts as
-  reachable.
+  Discovery's `nvidia.com/gpu.present=true` label, counts their GPUs, and
+  `K8sDriverVersionCheck` compares the driver on the nodes with the version
+  `setup.sh` reads from GFD's `nvidia.com/cuda.driver.*` labels, so the
+  reference environment runs the GPU Operator. Without GFD on the control plane
+  cluster, nothing stands in for its labels: the GPU label, count and pod
+  access checks fail, and `setup.sh` reports no driver version, so
+  `K8sDriverVersionCheck` does not compare (the suite reports that as passed,
+  "driver_version not configured").
+- **API network ACL.** On cloud clusters the tenant's API server is exposed
+  outside the cluster through a LoadBalancer whose `loadBalancerSourceRanges`
+  admit `VCLUSTER_API_ALLOWED_CIDRS`. `K8sApiNetworkAclCheck` requires kubectl
+  from the runner to succeed and a request from a pod in the cluster, outside
+  the allowlist, to the LoadBalancer address to be blocked. Any HTTP answer, a
+  401 included, counts as reachable, and a probe that gets no result within
+  its time limit fails the check. The pod sees the in-cluster path, where
+  kube-proxy enforces the source ranges; external clients meet the cloud's
+  firewall, which GKE builds from the same ranges. On dataplanes that skip
+  source ranges for in-cluster traffic, such as Cilium's kube-proxy
+  replacement, the probe reports reachable even though external clients are
+  blocked. The source ranges do not cover the Service's ClusterIP and NodePort,
+  so workloads inside the control plane cluster can still reach the API server,
+  with credentials.
 - **MIG.** `setup.sh` adds no `nvidia.com/mig.*` labels of its own. Where GPU
   Feature Discovery does not run, as on GKE COS, `K8sMigConfigCheck` finds no
   MIG nodes and skips.
@@ -201,7 +218,8 @@ list the results of that run.
   v0.5.0 (`manifests/`) with server-side apply for the multi-node NCCL workload.
 - **GPU taints.** `setup.sh` removes `nvidia.com/gpu:NoSchedule` from the GPU
   nodes for the run, so the conformance BeforeSuite treats every node as
-  schedulable. `teardown.sh` restores the taints.
+  schedulable. `teardown.sh` restores each taint with its original value (GKE's
+  is `nvidia.com/gpu=present:NoSchedule`).
 - **Access keys.** An access key is a ServiceAccount with a bound token.
   Disabling it removes its ClusterRoleBinding, so the token gets 403. Deleting
   it removes both, and the `VCLUSTER_NAMESPACE` namespace too when

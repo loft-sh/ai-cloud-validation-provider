@@ -38,9 +38,12 @@ GPU_TAINT_STATE_FILE="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}-gpu-taints.txt"
 # ---------------------------------------------------------------------------
 if [ -f "$GPU_TAINT_STATE_FILE" ]; then
     echo "Restoring nvidia.com/gpu:NoSchedule taints on host nodes..." >&2
-    while IFS= read -r node; do
+    # Lines are "<node><TAB><value>"; files from older setup.sh hold only names.
+    while IFS=$'\t' read -r node value; do
         [ -z "$node" ] && continue
-        if kubectl taint node "$node" nvidia.com/gpu:NoSchedule --overwrite >/dev/null 2>&1; then
+        taint="nvidia.com/gpu:NoSchedule"
+        [ -n "$value" ] && taint="nvidia.com/gpu=${value}:NoSchedule"
+        if kubectl taint node "$node" "$taint" --overwrite >/dev/null 2>&1; then
             echo "  Restored taint on ${node}." >&2
         else
             echo "  Warning: could not restore taint on ${node} (node may have been deleted)." >&2
@@ -64,7 +67,6 @@ if [ -f "$_PF_PIDFILE" ]; then
     fi
     rm -f "$_PF_PIDFILE"
 fi
-rm -f /tmp/vcluster-isv-lb-ip.txt
 
 echo "Deleting vCluster '${VCLUSTER_NAME}' from namespace '${VCLUSTER_NAMESPACE}'..." >&2
 
@@ -84,8 +86,21 @@ else
     echo "vCluster deleted." >&2
 fi
 
-# Remove the files setup.sh wrote for the API network ACL check
-rm -f /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
+# Remove the probe setup.sh wrote for the API network ACL check (and the /tmp
+# files older versions wrote)
+rm -f "${VCLUSTER_KUBECONFIG_PATH}.acl-probe.sh" /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
+
+# The control-plane suite's create_access_key.py may have created (and labeled)
+# this namespace before the vCluster instance moved in; remove it once empty.
+if [ -n "$(kubectl get namespaces -l ai-cloud-validation/created-by=create_access_key \
+        --field-selector "metadata.name=${VCLUSTER_NAMESPACE}" -o name 2>/dev/null)" ]; then
+    _LEFT=$(kubectl get serviceaccounts,pods,services,persistentvolumeclaims -n "$VCLUSTER_NAMESPACE" -o name 2>/dev/null \
+        | grep -v '^serviceaccount/default$' || true)
+    if [ -z "$_LEFT" ]; then
+        kubectl delete namespace "$VCLUSTER_NAMESPACE" --wait=false >/dev/null 2>&1 \
+            && echo "Deleted namespace ${VCLUSTER_NAMESPACE} (created by create_access_key.py)." >&2
+    fi
+fi
 
 # Remove the persisted kubeconfig
 if [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
