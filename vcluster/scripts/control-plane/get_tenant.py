@@ -63,7 +63,7 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="Region label (use 'vcluster')")
     args = parser.parse_args()
 
-    ns = os.environ.get("VCLUSTER_NAMESPACE", args.group_name)
+    ns = os.environ.get("VCLUSTER_NAMESPACE") or args.group_name
 
     result: dict[str, Any] = {
         "success": False,
@@ -89,7 +89,7 @@ def main() -> int:
                 "vcluster",
                 "list",
                 "--driver",
-                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                os.environ.get("VCLUSTER_DRIVER") or "helm",
                 "--namespace",
                 ns,
                 "--output",

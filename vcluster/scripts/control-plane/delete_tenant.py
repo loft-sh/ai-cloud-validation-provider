@@ -64,7 +64,7 @@ def main() -> int:
 
     # Namespace is derived from the tenant name (one vCluster per namespace).
     # Honour explicit override via VCLUSTER_NAMESPACE for backwards-compatibility.
-    ns = os.environ.get("VCLUSTER_NAMESPACE", args.group_name)
+    ns = os.environ.get("VCLUSTER_NAMESPACE") or args.group_name
 
     result: dict[str, Any] = {
         "success": False,
@@ -89,7 +89,7 @@ def main() -> int:
                 "delete",
                 args.group_name,
                 "--driver",
-                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                os.environ.get("VCLUSTER_DRIVER") or "helm",
                 "--namespace",
                 ns,
             ],

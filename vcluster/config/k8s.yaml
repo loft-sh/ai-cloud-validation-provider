@@ -106,14 +106,18 @@ tests:
           # whose loadBalancerSourceRanges admit only VCLUSTER_API_ALLOWED_CIDRS
           # (default: the runner's public IPv4 address). The authorized probe
           # (kubectl from the runner) must succeed. The unauthorized probe,
-          # written by setup.sh, connects from a pod in the cluster, which is
-          # outside the allowlist, and must be blocked at the network layer.
-          # It exits 0 on any HTTP answer, a 401 included, so an authentication
-          # error never counts as an ACL; it exits 127 if the probe pod cannot
-          # run, which the check reports as a failure.
+          # written by setup.sh next to the tenant's kubeconfig, connects from a
+          # pod in the cluster, which is outside the allowlist, and must be
+          # blocked at the network layer. It exits 0 on any HTTP answer, a 401
+          # included, so an authentication error never counts as an ACL. It
+          # finishes within 95 s and exits 127 if it cannot get a result, which
+          # the check reports as a failure, so a hang never passes as blocked.
+          # The probe sees the in-cluster path to the LoadBalancer address
+          # (kube-proxy enforces the source ranges there); external clients meet
+          # the cloud's firewall, which GKE builds from the same ranges.
           probe_timeout_s: 120
           commands:
-            unauthorized_probe: "bash /tmp/vcluster-isv-acl-probe.sh"
+            unauthorized_probe: "bash ${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}.acl-probe.sh"
 
     k8s_observability:
       checks:
@@ -128,21 +132,6 @@ tests:
             kube-apiserver: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-acv-tenant} -c syncer --tail=100 2>/dev/null"
             kube-scheduler: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-acv-tenant} -c syncer --tail=100 2>/dev/null"
             kube-controller-manager: "kubectl -n ${VCLUSTER_NAMESPACE:-vcluster-isv-validation} logs -l app=vcluster,release=${VCLUSTER_NAME:-acv-tenant} -c syncer --tail=100 2>/dev/null"
-
-    kubernetes:
-      checks:
-        K8sGpuLabelsCheck:
-          # GPU Feature Discovery's nvidia.com/gpu.present label exists only
-          # where GFD runs. On GKE COS setup.sh reports GKE's own GPU node label
-          # (cloud.google.com/gke-accelerator) instead.
-          label_selector: "{{ steps.setup.kubernetes.gpu_label_selector | default('nvidia.com/gpu.present=true') }}"
-
-        K8sDriverVersionCheck:
-          # GKE manages GPU drivers natively; GFD labels (nvidia.com/cuda.driver.*)
-          # are not set on GKE COS nodes, so setup.sh cannot determine the driver
-          # version.  Setting driver_version to "" instructs K8sDriverVersionCheck
-          # to skip the version comparison and report the check as passed (skipped).
-          driver_version: ""
 
     k8s_workloads:
       checks:

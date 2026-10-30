@@ -65,7 +65,7 @@ def main() -> int:
     tenant_name = f"isv-tenant-{int(time.time())}"
     # Each vCluster must be in its own namespace; derive it from the tenant name so
     # the control-plane suite can run independently of the k8s suite.
-    ns = os.environ.get("VCLUSTER_NAMESPACE", tenant_name)
+    ns = os.environ.get("VCLUSTER_NAMESPACE") or tenant_name
 
     result: dict[str, Any] = {
         "success": False,
@@ -91,13 +91,13 @@ def main() -> int:
                 "create",
                 tenant_name,
                 "--driver",
-                os.environ.get("VCLUSTER_DRIVER", "helm"),
+                os.environ.get("VCLUSTER_DRIVER") or "helm",
                 "--namespace",
                 ns,
                 "--connect=false",
                 # Same pin as scripts/k8s/setup.sh, so the run does not depend on the local CLI version.
                 "--chart-version",
-                os.environ.get("VCLUSTER_VERSION", "0.37.5"),
+                os.environ.get("VCLUSTER_VERSION") or "0.37.5",
             ],
             env,
         )
@@ -115,7 +115,7 @@ def main() -> int:
                     "vcluster",
                     "list",
                     "--driver",
-                    os.environ.get("VCLUSTER_DRIVER", "helm"),
+                    os.environ.get("VCLUSTER_DRIVER") or "helm",
                     "--namespace",
                     ns,
                     "--output",

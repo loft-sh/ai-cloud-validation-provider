@@ -20,8 +20,12 @@ credentials:
   plane cluster, and `setup.sh` lifts the `nvidia.com/gpu:NoSchedule` taint from
   GPU nodes for the run (`teardown.sh` restores it). The kubeconfig needs rights
   to do all of that, so run them against a cluster meant for validation.
-- `setup.sh` writes the tenant's kubeconfig to `VCLUSTER_KUBECONFIG_PATH`
-  (default `/tmp/vcluster-isv-validation.kubeconfig`); `teardown.sh` deletes it.
+- `setup.sh` writes the tenant's kubeconfig, which holds its admin
+  credentials, to `VCLUSTER_KUBECONFIG_PATH` (default
+  `/tmp/vcluster-isv-validation.kubeconfig`) with mode 600, and the network ACL
+  probe script next to it; `teardown.sh` deletes both. The suite runs that
+  script, so on a machine other people use, set `VCLUSTER_KUBECONFIG_PATH` to a
+  directory only you can write to.
 - On cloud clusters the tenant's API server is exposed through a LoadBalancer
   that admits only `VCLUSTER_API_ALLOWED_CIDRS` (default: this machine's public
   IPv4 address).
