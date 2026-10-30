@@ -111,7 +111,16 @@ def main() -> int:
 
         for _ in range(60):
             rc2, out2, _ = _run(
-                ["vcluster", "list", "--driver", os.environ.get("VCLUSTER_DRIVER", "helm"), "--namespace", ns, "--output", "json"],
+                [
+                    "vcluster",
+                    "list",
+                    "--driver",
+                    os.environ.get("VCLUSTER_DRIVER", "helm"),
+                    "--namespace",
+                    ns,
+                    "--output",
+                    "json",
+                ],
                 env,
             )
             if rc2 == 0 and out2:
