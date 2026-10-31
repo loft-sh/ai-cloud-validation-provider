@@ -66,7 +66,14 @@ fi
 
 # ---------------------------------------------------------------------------
 # Delete the tenant. Uses the ambient KUBECONFIG (control plane cluster).
+# vcluster delete reports a control plane cluster it cannot reach (expired
+# credentials, say) as "couldn't find vcluster", so check that first: an
+# unreachable cluster must fail the teardown, not read as an absent tenant.
 # ---------------------------------------------------------------------------
+if ! kubectl get --raw /version >/dev/null 2>&1; then
+    echo "Error: cannot reach the control plane cluster with the current KUBECONFIG; the tenant was not deleted." >&2
+    exit 1
+fi
 echo "Deleting vCluster '${VCLUSTER_NAME}' from namespace '${VCLUSTER_NAMESPACE}'..." >&2
 DELETE_RC=0
 DELETE_OUT=$(vc delete "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" 2>&1) || DELETE_RC=$?
