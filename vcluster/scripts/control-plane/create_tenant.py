@@ -17,8 +17,10 @@
 
 """Create a tenant (vCluster instance).
 
-Maps "tenant" to a vCluster instance in the configured namespace on the
-control plane cluster.
+Maps "tenant" to a vCluster instance with Private Nodes in the configured
+namespace on the control plane cluster. The tenant is connected to the vCluster
+Platform in VCLUSTER_PLATFORM_HOST, which licenses Private Nodes; it needs no
+worker nodes to serve its API.
 
 Required JSON output:
 {
@@ -40,6 +42,8 @@ import subprocess
 import sys
 import time
 from typing import Any
+
+from _platform import vcluster_cli
 
 DEMO_MODE = os.environ.get("ISVCTL_DEMO_MODE") == "1"
 
@@ -84,23 +88,28 @@ def main() -> int:
     try:
         env = _kubeconfig_env()
 
-        # Create the tenant (vCluster instance) (--connect=false: no auto port-forward)
-        rc, _, stderr = _run(
-            [
-                "vcluster",
-                "create",
-                tenant_name,
-                "--driver",
-                os.environ.get("VCLUSTER_DRIVER") or "helm",
-                "--namespace",
-                ns,
-                "--connect=false",
-                # Same pin as scripts/k8s/setup.sh, so the run does not depend on the local CLI version.
-                "--chart-version",
-                os.environ.get("VCLUSTER_VERSION") or "0.37.5",
-            ],
-            env,
-        )
+        # Create the tenant (vCluster instance) (--connect=false: no auto port-forward;
+        # --add: connect it to the Platform, which licenses Private Nodes)
+        with vcluster_cli(env) as vc:
+            rc, _, stderr = _run(
+                [
+                    *vc,
+                    "create",
+                    tenant_name,
+                    "--driver",
+                    os.environ.get("VCLUSTER_DRIVER") or "helm",
+                    "--namespace",
+                    ns,
+                    "--connect=false",
+                    "--add",
+                    # Same pin as scripts/k8s/setup.sh, so the run does not depend on the local CLI version.
+                    "--chart-version",
+                    os.environ.get("VCLUSTER_VERSION") or "0.37.6",
+                    "--set",
+                    "privateNodes.enabled=true",
+                ],
+                env,
+            )
         if rc != 0:
             result["error"] = f"vcluster create failed: {stderr}"
             print(json.dumps(result, indent=2))

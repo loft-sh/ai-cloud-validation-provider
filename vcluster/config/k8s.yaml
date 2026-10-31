@@ -19,52 +19,38 @@
 # Imports the provider-agnostic k8s suite from an ai-cloud-validation checkout
 # and wires it to the vCluster scripts in ../scripts/k8s/. vCluster runs a
 # Virtual Control Plane for each tenant on an existing Kubernetes cluster (the
-# control plane cluster). This provider validates the Shared Nodes tenancy
-# model: the tenant's cluster schedules GPU workloads onto the control plane
-# cluster's GPU nodes through sync.fromHost.nodes.
+# control plane cluster). This provider validates the Private Nodes tenancy
+# model: dedicated GPU nodes join the tenant's cluster, which runs its own CNI
+# (Calico), NVIDIA GPU Operator and DRA driver; nothing runs on, or is synced
+# to, the control plane cluster's nodes.
 #
 # Prerequisites (../README.md has the full list and how to reproduce a run):
-#   - vcluster CLI matching VCLUSTER_VERSION, kubectl, helm, jq, python3, curl
-#   - KUBECONFIG pointing at the control plane cluster
-#   - A control plane cluster CNI that enforces NetworkPolicies (for example
-#     GKE --enable-network-policy) for K8sNetworkPolicyCheck
+#   - vcluster CLI matching VCLUSTER_VERSION, kubectl, helm, jq, python3, curl, ssh
+#   - KUBECONFIG pointing at the control plane cluster, which must publish a
+#     LoadBalancer Service the worker nodes can reach
+#   - a vCluster Platform (the Free tier is enough) and an access key for it:
+#     VCLUSTER_PLATFORM_HOST, VCLUSTER_PLATFORM_ACCESS_KEY or _FILE
+#   - VCLUSTER_NODES: SSH destinations of the GPU worker nodes (passwordless
+#     sudo, a supported OS, no Kubernetes installed); VCLUSTER_NODE_SSH_KEY
 #   - NGC_API_KEY for nvcr.io pulls and the NIM workloads
 #
 # Optional:
-#   - VCLUSTER_VERSION         (default: 0.37.5)
+#   - VCLUSTER_VERSION         (default: 0.37.6)
 #   - VCLUSTER_NAME            (default: acv-tenant)
 #   - VCLUSTER_NAMESPACE       (default: vcluster-isv-validation)
 #   - VCLUSTER_KUBECONFIG_PATH (default: /tmp/vcluster-isv-validation.kubeconfig)
-#   - SKIP_PREFLIGHT           (default: false) - "true" skips GPU readiness waits
-#   - VCLUSTER_API_ALLOWED_CIDRS (default: the runner's public IPv4/32) - CIDRs
-#     admitted by the tenant API LoadBalancer (K8sApiNetworkAclCheck)
-#
-# GPU architecture:
-#   sync.fromHost.nodes.enabled=true            nodes, labels and GPU capacity
-#   sync.fromHost.runtimeClasses.enabled=false  setup.sh creates the nvidia RuntimeClass
-#
-#   When the control plane cluster already runs the GPU stack (the GPU Operator,
-#   or a cloud's managed drivers and device plugin), setup.sh installs nothing
-#   in the tenant's cluster: the operator's DaemonSets would sync a second
-#   device plugin onto the same nodes. The GPU stack belongs to the platform
-#   operator and the tenant can neither see nor replace it, so
-#   K8sGpuOperatorNamespaceCheck and K8sGpuOperatorPodsCheck fail by design
-#   (requirement K8S25). Without a GPU stack on the control plane cluster,
-#   setup.sh installs the GPU Operator with driver.enabled=false.
-#
-# CNCF conformance and GPU taints:
-#   setup.sh temporarily removes the nvidia.com/gpu:NoSchedule taint from the
-#   control plane cluster's GPU nodes so the e2e BeforeSuite treats every
-#   synced node as schedulable (it waits up to 30 minutes otherwise).
-#   teardown.sh restores the taints before deleting the tenant's cluster.
+#   - VCLUSTER_API_ALLOWED_CIDRS (default: the runner's and each node's public
+#     IPv4/32) - CIDRs admitted by the tenant API LoadBalancer
+#   - VCLUSTER_POD_CIDR, VCLUSTER_SERVICE_CIDR, CALICO_VERSION,
+#     GPU_OPERATOR_VERSION, DRA_DRIVER_VERSION
+#   - VCLUSTER_OIDC_ISSUER_URL and VCLUSTER_OIDC_PUBLISH_CMD - a public service
+#     account issuer for K8sOidcIssuerCheck
 #
 # Steps from the 1.0.0 k8s suite that this config does not wire (their checks
-# report step_not_configured): node pools, reset_gpus and cordon_node act on
-# the control plane cluster's nodes, which the platform operator manages, so
-# they are not tenant operations here; pin_control_plane, list_k8s_versions,
-# describe_control_plane_patching, the upgrade steps, service_account_iam_test
-# and the k8s_{load_balancer,dns_forwarding,cidr_ranges}_test probes still
-# need vCluster-specific implementations.
+# report step_not_configured): node pools, reset_gpus, cordon_node,
+# pin_control_plane, list_k8s_versions, describe_control_plane_patching, the
+# upgrade steps, service_account_iam_test and the
+# k8s_{load_balancer,dns_forwarding,cidr_ranges}_test probes.
 #
 # Usage, from the root of an ai-cloud-validation checkout:
 #   KUBECTL="kubectl --kubeconfig=/tmp/vcluster-isv-validation.kubeconfig" \
@@ -83,15 +69,17 @@ commands:
   kubernetes:
     phases: ["setup", "test", "teardown"]
     steps:
+      # Creating the tenant, joining the nodes and the GPU Operator's driver
+      # build take 15-25 minutes on fresh nodes.
       - name: setup
         phase: setup
         command: "../scripts/k8s/setup.sh"
-        timeout: 1200
+        timeout: 2700
 
       - name: teardown
         phase: teardown
         command: "../scripts/k8s/teardown.sh"
-        timeout: 300
+        timeout: 600
 
 tests:
   cluster_name: "acv-tenant"
@@ -103,18 +91,16 @@ tests:
         K8sApiNetworkAclCheck:
           # Requirement K8S15: the cluster endpoint must provide network access
           # controls. setup.sh exposes the tenant's API through a LoadBalancer
-          # whose loadBalancerSourceRanges admit only VCLUSTER_API_ALLOWED_CIDRS
-          # (default: the runner's public IPv4 address). The authorized probe
-          # (kubectl from the runner) must succeed. The unauthorized probe,
-          # written by setup.sh next to the tenant's kubeconfig, connects from a
-          # pod in the cluster, which is outside the allowlist, and must be
+          # whose loadBalancerSourceRanges admit only VCLUSTER_API_ALLOWED_CIDRS:
+          # by default the runner and the worker nodes, which reach the API
+          # server through it. The authorized probe (kubectl from the runner)
+          # must succeed. The unauthorized probe, written by setup.sh next to the
+          # tenant's kubeconfig, connects from a pod on the control plane
+          # cluster, whose egress address is outside the allowlist, and must be
           # blocked at the network layer. It exits 0 on any HTTP answer, a 401
           # included, so an authentication error never counts as an ACL. It
           # finishes within 95 s and exits 127 if it cannot get a result, which
           # the check reports as a failure, so a hang never passes as blocked.
-          # The probe sees the in-cluster path to the LoadBalancer address
-          # (kube-proxy enforces the source ranges there); external clients meet
-          # the cloud's firewall, which GKE builds from the same ranges.
           probe_timeout_s: 120
           commands:
             unauthorized_probe: "bash ${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}.acl-probe.sh"
@@ -123,9 +109,10 @@ tests:
       checks:
         K8sControlPlaneLogsCheck:
           # The Virtual Control Plane runs the API server, scheduler and
-          # controller manager in the vCluster pod's syncer container, so all
-          # three components log there. The pod is selected by label because its
-          # name depends on the workload kind the chart picks.
+          # controller manager in the vCluster pod's syncer container on the
+          # control plane cluster, so all three components log there. The pod is
+          # selected by label because its name depends on the workload kind the
+          # chart picks.
           mode: "command"
           components: ["kube-apiserver", "kube-scheduler", "kube-controller-manager"]
           commands:
@@ -136,83 +123,46 @@ tests:
     k8s_workloads:
       checks:
         K8sNcclMultiNodeWorkload:
-          # tenants (vCluster instances) have a virtual control plane (runs as a pod
-          # in the host namespace); no host node carries the
-          # node-role.kubernetes.io/control-plane label visible to the tenant.
-          # Setting override_launcher_affinity removes the affinity so the MPI
-          # launcher pod schedules on any available CPU node.
+          # The tenant's control plane is virtual, so no node carries the
+          # node-role.kubernetes.io/control-plane label; let the MPI launcher
+          # schedule on any node.
           override_launcher_affinity: true
-          # GKE COS: no "nvidia" containerd runtime handler (device-plugin model).
-          # Remove runtimeClassName from worker pods so they can schedule normally.
-          runtime_class_name: ""
-          # Reference environment: two T4 nodes with one GPU each. Match these
-          # to the GPU nodes of your control plane cluster.
+          # Reference environment: two L4 nodes with one GPU each. Match these
+          # to your GPU nodes.
           nodes: 2
           gpus_per_node: 1
           # quick_mode uses 1M-256M message range (~30s) instead of 8B-4G (~5m).
           quick_mode: true
-          # No DRA driver on this cluster; disable ComputeDomain/IMEX.
+          # No NVLink domain between these nodes (setup.sh turns the DRA
+          # driver's ComputeDomains off); run NCCL over the pod network.
           use_compute_domain: "false"
           # Allow time for hpc-benchmarks image pull on first run.
           startup_timeout: 600
           timeout: 900
-          # Validate that multi-node NCCL all-reduce runs end-to-end on the
-          # tenant; do NOT enforce a NVLink/InfiniBand-class bandwidth floor
-          # because this cluster uses T4 GPUs on n1-standard-4 nodes connected
-          # only by standard GKE pod networking (~1 GB/s ceiling). Reviewers
-          # validating on A100/H100 + IB clusters should override
-          # min_bus_bw_gbps in their own provider config.
+          # Validate that multi-node NCCL all-reduce runs end to end; do not
+          # enforce an NVLink/InfiniBand-class bandwidth floor, because the
+          # reference nodes are connected only by standard cloud networking.
+          # Clusters with InfiniBand or RoCE should set min_bus_bw_gbps.
           min_bus_bw_gbps: 0
 
         K8sGpuStressWorkload:
-          # GKE COS nodes use containerd with the device-plugin model; the
-          # "nvidia" runtime handler is not registered in containerd's config.
-          # GPU pods only need nvidia.com/gpu resource limits - no runtimeClassName.
-          # Hardcoded "" instead of a step template because isvctl drops YAML
-          # keys whose template resolves to an empty string, which would cause
-          # k8s_stress.py to fall back to its default runtimeClassName: nvidia.
-          runtime_class_name: ""
           # nvcr.io/nvidia/pytorch:25.04-py3 is ~8 GB; on a cold node the pull
-          # alone can exceed the suite default of 300s.  600s gives a full pull
-          # window while remaining well within the 1200s step timeout.
+          # alone can exceed the suite default of 300s.
           timeout: 600
 
         K8sNimInferenceWorkload:
-          # GKE COS: no "nvidia" runtimeClassName (device-plugin model, see above).
-          runtime_class_name: ""
-          # T4 GPU nodes (n1-standard-4 equivalent) have ~12.6 GiB allocatable.
-          # The manifest's default 16 GiB request would never schedule; Llama 3.2 3B
-          # needs ~8-10 GiB at runtime so 4 GiB request + 12 GiB limit is safe.
-          nim_memory_request: "4Gi"
-          nim_memory_limit: "12Gi"
-          # T4 16 GB VRAM: default max_seq_len 131072 exceeds available KV-cache
-          # (~54848 tokens), causing the vLLM engine to abort.  4096 fits
-          # comfortably within the KV-cache budget for Llama 3.2 3B on T4.
-          nim_max_model_len: "4096"
-          # Cold T4 node: image pull (~7m) + model download (~15m) + vLLM load
-          # (~12m) + inference = ~35m observed.  2700s gives 45m headroom.
+          # L4 (24 GB): cap the context so the KV cache fits next to the 3B
+          # model's weights; the default 131072 tokens may not.
+          nim_max_model_len: "32768"
+          # Cold node: image pull + model download + load + inference.
           timeout: 2700
 
         K8sNimHelmWorkload-1b:
-          # GKE COS: no "nvidia" runtimeClassName (device-plugin model).
-          runtime_class_name: ""
-          # T4 node memory constraint - override chart defaults to fit ~12.6 GiB allocatable.
-          memory_request: "4Gi"
-          memory_limit: "12Gi"
-          # T4 16 GB VRAM: same KV-cache constraint as NimInferenceWorkload above.
-          nim_max_model_len: "4096"
-          # Same cold-start budget as K8sNimInferenceWorkload.
+          nim_max_model_len: "32768"
           timeout: 2700
 
         K8sNimHelmWorkload-3b:
-          # GKE COS: no "nvidia" runtimeClassName (device-plugin model).
-          runtime_class_name: ""
-          # T4 node memory constraint - override chart defaults to fit ~12.6 GiB allocatable.
-          memory_request: "4Gi"
-          memory_limit: "12Gi"
-          # T4 16 GB VRAM: same KV-cache constraint as NimInferenceWorkload above.
-          nim_max_model_len: "4096"
-          # Same cold-start budget as K8sNimInferenceWorkload.
+          nim_max_model_len: "32768"
           timeout: 2700
 
     k8s_conformance:
@@ -223,40 +173,3 @@ tests:
           startup_timeout: 600
           cleanup_namespace: true
           report_individual_tests: false
-          # Two skips, both for vCluster 0.37.5 behavior found in its source. A
-          # run with no skips (2026-10-30, conformance image v1.36.6, the
-          # reference environment in ../README.md) ran 443 specs: 439 passed,
-          # 4 failed.
-          #
-          # Skipped:
-          # - "issue 500 podspec updates and verify generation and
-          #   observedGeneration eventually converge": the syncer copies the host
-          #   pod's status.observedGeneration into the tenant's pod unchanged
-          #   (pods/translate/diff.go). It folds rapid spec updates into fewer
-          #   host updates, so the host pod ends at generation 490 while the
-          #   tenant's pod is at 500, and observedGeneration never converges.
-          # - "AdmissionWebhook should be able to deny attaching pod"
-          #   (intermittent: failed in 1 of 3 runs with the webhook routing
-          #   below): vCluster serves exec, attach and port-forward itself and
-          #   calls admission webhooks for them from its syncer, whose webhook
-          #   client always uses the Service ClusterIP (server/server.go
-          #   initAdmission). The spec attaches as soon as its webhook answers
-          #   through the API server, which uses endpoint IPs, so the syncer's
-          #   first call can still meet a ClusterIP the control plane cluster's
-          #   kube-proxy has not programmed. The failing run's log was not kept,
-          #   so this cause is inferred from the source, not from a trace.
-          #
-          # The other three failures are fixed by configuration, not skipped:
-          # - "multiple endpoint IPs / ports specified in multiple
-          #   EndpointSlices": vCluster builds the host EndpointSlice's
-          #   kubernetes.io/service-name label without the hashing it applies to
-          #   host Service names over 63 characters, so with a long tenant name
-          #   the selector-less Service gets no endpoints. Both pass with the
-          #   default VCLUSTER_NAME (acv-tenant); keep it at 14 characters or less.
-          # - "CustomResourceConversionWebhook" (either spec, intermittently): the
-          #   tenant's API server called the new webhook Service by ClusterIP
-          #   before the control plane cluster's kube-proxy had programmed it, and
-          #   the blackholed connection outlasted the spec's 30 s wait. setup.sh
-          #   enables --enable-aggregator-routing, so webhooks are called on their
-          #   endpoint IPs.
-          e2e_skip: "issue 500 podspec updates and verify generation and observedGeneration eventually converge|should be able to deny attaching pod"

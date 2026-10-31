@@ -14,33 +14,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# shellcheck source-path=SCRIPTDIR
 
-# vCluster K8s Setup - Creates a tenant (vCluster instance) on the control
-# plane cluster, optionally installs the NVIDIA GPU Operator inside it, then
-# emits the inventory JSON consumed by isvctl.
+# vCluster K8s Setup - Creates a tenant (vCluster instance) with vCluster's
+# Private Nodes tenancy model: its control plane runs on the control plane
+# cluster, and dedicated worker nodes, joined over SSH, run its workloads. The
+# tenant's cluster gets its own CNI (Calico) and NVIDIA GPU Operator, then the
+# script emits the inventory JSON consumed by isvctl.
 #
 # Requirements:
 #   - vcluster CLI matching VCLUSTER_VERSION (https://www.vcluster.com/docs/getting-started/setup)
-#   - kubectl configured to point at the control plane cluster
-#   - helm
-#   - jq
-#   - python3
+#   - kubectl configured to point at the control plane cluster, which must be
+#     able to publish a LoadBalancer Service the worker nodes can reach
+#   - helm, jq, python3, curl, ssh
+#   - a vCluster Platform and an access key for it: Private Nodes is a vCluster
+#     Free tier feature, licensed through the Platform at no cost
+#   - worker nodes reachable over SSH as a user with passwordless sudo, running
+#     an OS vCluster supports for private nodes (Ubuntu 22.04 or 24.04, RHEL 8
+#     to 10, Rocky, CentOS Stream) with their NVIDIA GPUs attached and no
+#     Kubernetes installed. The NVIDIA driver comes from the GPU Operator.
 #
 # Environment variables:
-#   VCLUSTER_VERSION         - vCluster chart version to deploy (default: 0.37.5)
-#   VCLUSTER_DRIVER          - vcluster CLI driver (default: helm, so a CLI configured
-#                              for Docker still deploys into the control plane cluster)
-#   VCLUSTER_NAME            - tenant's cluster name (default: acv-tenant; keep it at
-#                              14 characters or less, see config/k8s.yaml)
-#   VCLUSTER_NAMESPACE       - host namespace      (default: vcluster-isv-validation)
-#   VCLUSTER_KUBECONFIG_PATH - where to write the tenant kubeconfig
-#                              (default: /tmp/vcluster-isv-validation.kubeconfig)
-#   VCLUSTER_EXPOSE          - "true" to expose the tenant API via a LoadBalancer
-#                              service (recommended for cloud; auto-detected)
-#   VCLUSTER_API_ALLOWED_CIDRS - comma-separated CIDRs allowed to reach that
-#                              LoadBalancer (default: this machine's public IPv4/32)
-#   NGC_API_KEY             - NGC token for nvcr.io pulls (GPU Operator + NIM)
-#   SKIP_PREFLIGHT           - "true" to skip GPU-readiness checks (default: false)
+#   VCLUSTER_PLATFORM_HOST       - vCluster Platform URL (required)
+#   VCLUSTER_PLATFORM_ACCESS_KEY - access key for that Platform (required, or
+#                                  VCLUSTER_PLATFORM_ACCESS_KEY_FILE)
+#   VCLUSTER_PLATFORM_INSECURE   - "true" if the Platform's certificate is self-signed
+#   VCLUSTER_NODES               - space-separated SSH destinations (user@host) of
+#                                  the worker nodes (required)
+#   VCLUSTER_NODE_SSH_KEY        - private key for those nodes (default: ssh's own)
+#   VCLUSTER_NODE_SSH_OPTS       - extra ssh options, e.g. "-o UserKnownHostsFile=..."
+#   VCLUSTER_VERSION             - vCluster chart version to deploy (default: 0.37.6)
+#   VCLUSTER_NAME                - tenant's cluster name (default: acv-tenant)
+#   VCLUSTER_NAMESPACE           - namespace on the control plane cluster
+#                                  (default: vcluster-isv-validation)
+#   VCLUSTER_KUBECONFIG_PATH     - where to write the tenant kubeconfig
+#                                  (default: /tmp/vcluster-isv-validation.kubeconfig)
+#   VCLUSTER_API_ALLOWED_CIDRS   - comma-separated CIDRs allowed to reach the
+#                                  tenant's API LoadBalancer (default: this
+#                                  machine's and each node's public IPv4 /32)
+#   VCLUSTER_POD_CIDR            - tenant pod CIDR (default: 172.20.0.0/16)
+#   VCLUSTER_SERVICE_CIDR        - tenant Service CIDR (default: 172.21.0.0/16)
+#   CALICO_VERSION               - Calico release for the tenant's CNI (default: v3.32.3)
+#   GPU_OPERATOR_VERSION         - NVIDIA GPU Operator release (default: v26.7.2)
+#   DRA_DRIVER_VERSION           - NVIDIA DRA driver for GPUs chart (default: 25.12.0)
+#   VCLUSTER_OIDC_ISSUER_URL     - public HTTPS URL to issue service account tokens
+#                                  under (requirement K8S17-02). Unset keeps the
+#                                  in-cluster issuer, which only the cluster can discover.
+#   VCLUSTER_OIDC_PUBLISH_CMD    - command that publishes the directory passed as its
+#                                  last argument (.well-known/openid-configuration and
+#                                  openid/v1/jwks) at VCLUSTER_OIDC_ISSUER_URL
+#   NGC_API_KEY                  - NGC token for nvcr.io pulls (NIM, hpc-benchmarks)
 #
 # Usage, from the root of an ai-cloud-validation checkout (see ../../README.md):
 #   KUBECTL="kubectl --kubeconfig=/tmp/vcluster-isv-validation.kubeconfig" \
@@ -50,520 +73,354 @@
 set -eo pipefail
 
 # ---------------------------------------------------------------------------
-# Tooling check
+# Tooling and inputs
 # ---------------------------------------------------------------------------
-for tool in vcluster kubectl helm jq python3 curl; do
+for tool in vcluster kubectl helm jq python3 curl ssh; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Error: '$tool' not found in PATH." >&2
         exit 1
     fi
 done
 
-VCLUSTER_VERSION="${VCLUSTER_VERSION:-0.37.5}"
-VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-helm}"
+VCLUSTER_VERSION="${VCLUSTER_VERSION:-0.37.6}"
 VCLUSTER_NAME="${VCLUSTER_NAME:-acv-tenant}"
 VCLUSTER_NAMESPACE="${VCLUSTER_NAMESPACE:-vcluster-isv-validation}"
 VCLUSTER_KUBECONFIG_PATH="${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}"
-SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
-# vCluster 0.37.5 builds the host EndpointSlice service-name label as
-# <service>-x-<namespace>-x-<name> without hashing it past 63 characters, so a
-# longer name breaks selector-less Services (two CNCF conformance specs).
-if [ "${#VCLUSTER_NAME}" -gt 14 ]; then
-    echo "Error: VCLUSTER_NAME '${VCLUSTER_NAME}' is longer than 14 characters; see config/k8s.yaml." >&2
+VCLUSTER_POD_CIDR="${VCLUSTER_POD_CIDR:-172.20.0.0/16}"
+VCLUSTER_SERVICE_CIDR="${VCLUSTER_SERVICE_CIDR:-172.21.0.0/16}"
+CALICO_VERSION="${CALICO_VERSION:-v3.32.3}"
+GPU_OPERATOR_VERSION="${GPU_OPERATOR_VERSION:-v26.7.2}"
+DRA_DRIVER_VERSION="${DRA_DRIVER_VERSION:-25.12.0}"
+VCLUSTER_OIDC_ISSUER_URL="${VCLUSTER_OIDC_ISSUER_URL%/}"
+if [ -n "$VCLUSTER_OIDC_ISSUER_URL" ] && [ -z "${VCLUSTER_OIDC_PUBLISH_CMD:-}" ]; then
+    echo "Error: VCLUSTER_OIDC_ISSUER_URL needs VCLUSTER_OIDC_PUBLISH_CMD to publish the issuer's documents." >&2
     exit 1
 fi
-# Save host kubeconfig before we switch KUBECONFIG to the tenant's cluster below.
+if [ -z "${VCLUSTER_PLATFORM_ACCESS_KEY:-}" ] && [ -n "${VCLUSTER_PLATFORM_ACCESS_KEY_FILE:-}" ]; then
+    VCLUSTER_PLATFORM_ACCESS_KEY=$(tr -d '[:space:]' < "$VCLUSTER_PLATFORM_ACCESS_KEY_FILE")
+fi
+if [ -z "${VCLUSTER_PLATFORM_HOST:-}" ] || [ -z "${VCLUSTER_PLATFORM_ACCESS_KEY:-}" ]; then
+    echo "Error: set VCLUSTER_PLATFORM_HOST and VCLUSTER_PLATFORM_ACCESS_KEY (Private Nodes is licensed through vCluster Platform)." >&2
+    exit 1
+fi
+read -r -a NODES <<<"${VCLUSTER_NODES:-}"
+if [ "${#NODES[@]}" -eq 0 ]; then
+    echo "Error: set VCLUSTER_NODES to the SSH destinations of the worker nodes." >&2
+    exit 1
+fi
+
+# The control plane cluster's kubeconfig, saved before KUBECONFIG switches to the tenant.
 HOST_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-# State file for taint restoration at teardown.
-GPU_TAINT_STATE_FILE="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}-gpu-taints.txt"
+HOST_CONTEXT=$(kubectl --kubeconfig="$HOST_KUBECONFIG" config current-context)
+# Files this script keeps next to the tenant's kubeconfig; teardown.sh removes them.
+STATE_PREFIX="${VCLUSTER_KUBECONFIG_PATH%.kubeconfig}"
+VCLUSTER_CLI_CONFIG="${STATE_PREFIX}-cli.json"
+VALUES_FILE="${STATE_PREFIX}-values.yaml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The vcluster CLI keeps its Platform login in its own config, never ~/.vcluster.
+vc() { vcluster --config "$VCLUSTER_CLI_CONFIG" "$@"; }
+SSH_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+[ -n "${VCLUSTER_NODE_SSH_KEY:-}" ] && SSH_CMD+=(-i "$VCLUSTER_NODE_SSH_KEY" -o IdentitiesOnly=yes)
+# shellcheck disable=SC2206 # options are meant to split into words
+[ -n "${VCLUSTER_NODE_SSH_OPTS:-}" ] && SSH_CMD+=(${VCLUSTER_NODE_SSH_OPTS})
+node_ssh() { local dest="$1"; shift; "${SSH_CMD[@]}" "$dest" "$@"; }
 
 # ---------------------------------------------------------------------------
-# Auto-detect cloud provider BEFORE creation so --expose can be passed to
-# vcluster create. On cloud clusters the local background proxy can time out
-# during long runs (CNCF conformance ~2 hours); LoadBalancer exposure gives a
-# stable endpoint that survives the full suite.
+# Log in to vCluster Platform. vcluster create --add then connects the tenant
+# to it, which licenses Private Nodes.
 # ---------------------------------------------------------------------------
-if [ -z "${CLOUD_PROVIDER:-}" ]; then
-    CLOUD_PROVIDER=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    labels = json.load(sys.stdin).get('items', [{}])[0].get('metadata', {}).get('labels', {})
-    if 'cloud.google.com/gke-nodepool' in labels: print('gke')
-    elif 'eks.amazonaws.com/nodegroup' in labels: print('eks')
-    elif 'kubernetes.azure.com/agentpool' in labels: print('aks')
-    else: print('')
-except Exception: print('')
-" 2>/dev/null || echo "")
-fi
-if [ -z "${VCLUSTER_EXPOSE:-}" ] && [ -n "$CLOUD_PROVIDER" ]; then
-    echo "Detected cloud provider: ${CLOUD_PROVIDER}. Enabling LoadBalancer exposure." >&2
-    VCLUSTER_EXPOSE="true"
-fi
+LOGIN_ARGS=(--access-key "$VCLUSTER_PLATFORM_ACCESS_KEY" --docker-login=false)
+[ "${VCLUSTER_PLATFORM_INSECURE:-false}" = "true" ] && LOGIN_ARGS+=(--insecure)
+(
+    umask 077
+    vc platform login "$VCLUSTER_PLATFORM_HOST" "${LOGIN_ARGS[@]}" >/dev/null
+)
+echo "Logged in to vCluster Platform ${VCLUSTER_PLATFORM_HOST}." >&2
 
 # ---------------------------------------------------------------------------
 # API endpoint allowlist (requirement K8S15: the cluster endpoint must provide
-# network access controls). The LoadBalancer only admits
-# VCLUSTER_API_ALLOWED_CIDRS; by default that is this machine's public IPv4
-# address, so keep it stable for the whole run (or set the variable to your
-# office or VPN range).
+# network access controls). Worker nodes join and talk to the API server
+# through the tenant's LoadBalancer, so it admits this machine and the nodes'
+# public egress addresses, and nothing else unless VCLUSTER_API_ALLOWED_CIDRS
+# says so.
 # ---------------------------------------------------------------------------
-VCLUSTER_API_ALLOWED_CIDRS="${VCLUSTER_API_ALLOWED_CIDRS:-}"
-if [ "${VCLUSTER_EXPOSE:-false}" = "true" ] && [ -z "$VCLUSTER_API_ALLOWED_CIDRS" ]; then
-    _RUNNER_IP=$(curl -4 -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
-    if ! [[ "$_RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Error: could not detect this machine's public IPv4 address; set VCLUSTER_API_ALLOWED_CIDRS." >&2
-        exit 1
-    fi
-    VCLUSTER_API_ALLOWED_CIDRS="${_RUNNER_IP}/32"
+public_ipv4() { curl -4 -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]'; }
+if [ -z "${VCLUSTER_API_ALLOWED_CIDRS:-}" ]; then
+    _CIDRS=""
+    for _src in runner "${NODES[@]}"; do
+        if [ "$_src" = "runner" ]; then
+            _IP=$(public_ipv4 || true)
+        else
+            _IP=$(node_ssh "$_src" 'curl -4 -fsS --max-time 10 https://checkip.amazonaws.com' 2>/dev/null | tr -d '[:space:]' || true)
+        fi
+        if ! [[ "$_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: could not detect the public IPv4 address of ${_src}; set VCLUSTER_API_ALLOWED_CIDRS." >&2
+            exit 1
+        fi
+        _CIDRS="${_CIDRS},${_IP}/32"
+    done
+    VCLUSTER_API_ALLOWED_CIDRS="$_CIDRS"
 fi
-# Normalize the list: no spaces, no empty entries (a trailing comma breaks the chart).
-VCLUSTER_API_ALLOWED_CIDRS=$(python3 -c 'import sys; print(",".join(c.strip() for c in sys.argv[1].split(",") if c.strip()))' "$VCLUSTER_API_ALLOWED_CIDRS")
-[ "${VCLUSTER_EXPOSE:-false}" = "true" ] && echo "API LoadBalancer allowlist: ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
+# Normalize the list: no spaces, no empty entries, no duplicates.
+VCLUSTER_API_ALLOWED_CIDRS=$(python3 -c '
+import sys
+seen = []
+for c in sys.argv[1].split(","):
+    c = c.strip()
+    if c and c not in seen:
+        seen.append(c)
+print(",".join(seen))' "$VCLUSTER_API_ALLOWED_CIDRS")
+echo "API LoadBalancer allowlist: ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
 
 # ---------------------------------------------------------------------------
-# Create vCluster (skip if already Running)
-# --expose: creates a LoadBalancer service and embeds the LB IP in the TLS
-# cert so that vcluster connect --print produces a stable kubeconfig endpoint.
+# Create the tenant (skip if it already exists)
 # ---------------------------------------------------------------------------
-EXISTING_STATUS=$(vcluster list --driver "$VCLUSTER_DRIVER" --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
-    | python3 -c "
+python3 - "$VALUES_FILE" "$VCLUSTER_API_ALLOWED_CIDRS" "$VCLUSTER_POD_CIDR" "$VCLUSTER_SERVICE_CIDR" "$VCLUSTER_OIDC_ISSUER_URL" <<'PYEOF'
+import json, sys
+path, cidrs, pod_cidr, service_cidr, oidc_issuer = sys.argv[1:6]
+values = {
+    # Dedicated worker nodes join the tenant's cluster; no workload runs on,
+    # or is synced to, the control plane cluster.
+    "privateNodes": {"enabled": True},
+    "controlPlane": {
+        # A real etcd, as in vCluster's CNCF-certified Private Nodes
+        # configuration (cncf/k8s-conformance v1.36/vcluster-with-private-nodes).
+        "backingStore": {"etcd": {"deploy": {"enabled": True}}},
+        "service": {"spec": {"type": "LoadBalancer", "loadBalancerSourceRanges": cidrs.split(",")}},
+        # Headroom for CNCF conformance, which creates hundreds of namespaces.
+        "statefulSet": {"resources": {"requests": {"cpu": "500m", "memory": "512Mi"}}},
+    },
+    "networking": {"podCIDR": pod_cidr, "serviceCIDR": service_cidr},
+    # Calico replaces the default Flannel: Flannel does not enforce NetworkPolicy.
+    "deploy": {"cni": {"flannel": {"enabled": False}}},
+}
+if oidc_issuer:
+    # Tokens are issued under the public issuer (the first value); the default
+    # in-cluster issuer stays accepted. vCluster drops its own issuer flag when
+    # extraArgs set one.
+    api_server_args = [
+        "--service-account-issuer=" + oidc_issuer,
+        "--service-account-issuer=https://kubernetes.default.svc.cluster.local",
+        "--service-account-jwks-uri=" + oidc_issuer + "/openid/v1/jwks",
+    ]
+else:
+    # Issuer discovery advertises the in-cluster API address, as in the
+    # CNCF-certified Private Nodes configuration.
+    api_server_args = ["--service-account-jwks-uri=https://kubernetes.default.svc.cluster.local/openid/v1/jwks"]
+values["controlPlane"]["distro"] = {"k8s": {"apiServer": {"extraArgs": api_server_args}}}
+with open(path, "w") as f:
+    json.dump(values, f, indent=2)
+PYEOF
+
+tenant_status() {
+    vc list --driver helm --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null | python3 -c "
 import json, sys
 items = json.load(sys.stdin) or []
-match = next((v for v in items if v.get('Name') == '${VCLUSTER_NAME}'), None)
+match = next((v for v in items if v.get('Name') == sys.argv[1]), None)
 print(match['Status'] if match else '')
-" 2>/dev/null || echo "")
+" "$VCLUSTER_NAME" 2>/dev/null || echo ""
+}
 
+EXISTING_STATUS=$(tenant_status)
 if [ -z "$EXISTING_STATUS" ]; then
-    echo "Creating vCluster '${VCLUSTER_NAME}' (chart ${VCLUSTER_VERSION}) in namespace '${VCLUSTER_NAMESPACE}'..." >&2
-    CREATE_ARGS=(
-        "$VCLUSTER_NAME"
-        --driver "$VCLUSTER_DRIVER"
-        --namespace "$VCLUSTER_NAMESPACE"
-        # Pin the chart so a run is reproducible; otherwise the CLI deploys its own version.
-        --chart-version "$VCLUSTER_VERSION"
-        --connect=false
-        --set sync.fromHost.nodes.enabled=true
-        --set sync.fromHost.nodes.selector.all=true
-        # RuntimeClasses are managed manually below rather than via sync.fromHost
-        # so that CNCF conformance tests can freely create/delete RuntimeClass objects
-        # in the tenant without the syncer immediately reconciling them away.
-        # The 'nvidia' RuntimeClass is created explicitly in the tenant after connect.
-        --set sync.fromHost.runtimeClasses.enabled=false
-        --set sync.toHost.networkPolicies.enabled=true
-        # Back the Virtual Control Plane with a real etcd instead of the default
-        # embedded database (kine/SQLite), so list continue tokens expire on
-        # compaction as the "compacted away" conformance test expects. The
-        # chart-deployed etcd is open source and is what the CNCF-certified
-        # Shared Nodes configuration uses; embedded etcd is a vCluster Platform
-        # feature and would require a Platform login.
-        --set controlPlane.backingStore.etcd.deploy.enabled=true
-        # Ensure the virtual control plane has sufficient scheduling headroom for
-        # CNCF conformance (441 tests, each creating a namespace and waiting for
-        # the default ServiceAccount to be created).  No CPU limit is set so
-        # kube-controller-manager can burst freely when processing namespace
-        # events; adding a CPU limit would throttle it under sustained load.
-        --set 'controlPlane.statefulSet.resources.requests.cpu=500m'
-        --set 'controlPlane.statefulSet.resources.requests.memory=512Mi'
-        # Match vCluster's CNCF-certified Shared Nodes configuration
-        # (cncf/k8s-conformance v1.36/vcluster-with-shared-nodes):
-        # the virtual scheduler schedules against the tenant's view of the nodes,
-        # so node labels, taints and extended resources set inside the tenant's
-        # cluster take effect.
-        --set controlPlane.advanced.virtualScheduler.enabled=true
-        --set controlPlane.statefulSet.scheduling.podManagementPolicy=OrderedReady
-        # Nodes keep their real addresses instead of kubelet-proxy addresses, so
-        # NodePort and EndpointSlice traffic reaches kube-proxy.
-        --set networking.advanced.proxyKubelets.byHostname=false
-        --set networking.advanced.proxyKubelets.byIP=false
-        # Service account issuer discovery advertises the in-cluster API address.
-        --set 'controlPlane.distro.k8s.apiServer.extraArgs[0]=--service-account-jwks-uri=https://kubernetes.default.svc.cluster.local/openid/v1/jwks'
-        # Call admission and conversion webhooks and aggregated APIs on their
-        # endpoint IPs, as managed control planes do. Through the Service
-        # ClusterIP, a webhook created moments earlier is unreachable until the
-        # control plane cluster's kube-proxy programs it (GKE resyncs at most
-        # every 10 s), and conntrack keeps that first connection blackholed.
-        --set 'controlPlane.distro.k8s.apiServer.extraArgs[1]=--enable-aggregator-routing=true'
-        --set sync.toHost.persistentVolumes.enabled=true
-        --set sync.toHost.priorityClasses.enabled=true
-        --set sync.toHost.storageClasses.enabled=true
-        --set sync.fromHost.csiDrivers.enabled=false
-        --set sync.fromHost.csiStorageCapacities.enabled=false
-    )
-    if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
-        CREATE_ARGS+=(--expose --set "controlPlane.service.spec.loadBalancerSourceRanges={${VCLUSTER_API_ALLOWED_CIDRS}}")
-    fi
-    vcluster create "${CREATE_ARGS[@]}" >&2
+    echo "Creating vCluster '${VCLUSTER_NAME}' (chart ${VCLUSTER_VERSION}, Private Nodes) in namespace '${VCLUSTER_NAMESPACE}'..." >&2
+    # --expose puts the LoadBalancer address in the API server certificate, so
+    # nodes and kubeconfigs can use it; --add connects the tenant to the Platform.
+    vc create "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" \
+        --chart-version "$VCLUSTER_VERSION" --connect=false --add --expose \
+        -f "$VALUES_FILE" >&2
 else
     echo "vCluster '${VCLUSTER_NAME}' already exists (status: ${EXISTING_STATUS}), reusing." >&2
-fi
-
-# A reused vCluster keeps the allowlist it was created with: apply the current
-# one before anything connects through the LoadBalancer.
-if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
+    # A reused tenant keeps the allowlist it was created with: apply the current one.
     _RANGES_JSON=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1].split(",")))' "$VCLUSTER_API_ALLOWED_CIDRS")
-    kubectl --kubeconfig="${HOST_KUBECONFIG}" -n "${VCLUSTER_NAMESPACE}" patch svc "${VCLUSTER_NAME}" \
-        --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null \
-        && echo "API LoadBalancer restricted to ${VCLUSTER_API_ALLOWED_CIDRS}" >&2
+    kubectl --kubeconfig="$HOST_KUBECONFIG" -n "$VCLUSTER_NAMESPACE" patch svc "$VCLUSTER_NAME" \
+        --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null
 fi
 
-# ---------------------------------------------------------------------------
-# Wait for Running
-# ---------------------------------------------------------------------------
 echo "Waiting for vCluster to reach Running status..." >&2
 for i in $(seq 1 60); do
-    STATUS=$(vcluster list --driver "$VCLUSTER_DRIVER" --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null \
-        | python3 -c "
-import json, sys
-items = json.load(sys.stdin) or []
-match = next((v for v in items if v.get('Name') == '${VCLUSTER_NAME}'), None)
-print(match['Status'] if match else 'NotFound')
-" 2>/dev/null || echo "Unknown")
+    STATUS=$(tenant_status)
     [ "$STATUS" = "Running" ] && { echo "vCluster is Running." >&2; break; }
-    [ "$i" -eq 60 ] && { echo "Error: vCluster did not reach Running status within 5 minutes." >&2; exit 1; }
-    echo "  Attempt ${i}/60: status=${STATUS}" >&2
+    [ "$i" -eq 60 ] && { echo "Error: vCluster did not reach Running status within 5 minutes (status: ${STATUS:-none})." >&2; exit 1; }
     sleep 5
 done
 
 # ---------------------------------------------------------------------------
-# Detect host GPU state BEFORE switching kubeconfig
-#
-# HOST_GFD: nvidia.com/gpu.present=true, set by GPU Feature Discovery when the
-# GPU Operator runs on the control plane cluster.
-# HOST_MANAGED_GPU: the control plane cluster already manages the GPUs, either
-# through the GPU Operator (HOST_GFD) or because its nodes advertise
-# nvidia.com/gpu, meaning a device plugin runs there (for example GKE's own with
-# gpu-driver-version=default). Installing the GPU Operator in the tenant's
-# cluster would then add a second device plugin. Cloud labels such as
-# cloud.google.com/gke-accelerator alone do not count: they are present even
-# when nothing manages the GPUs yet (gpu-driver-version=disabled).
-# ---------------------------------------------------------------------------
-read -r HOST_GFD HOST_MANAGED_GPU < <(kubectl get nodes -o json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    nodes = json.load(sys.stdin).get('items', [])
-    gfd = any(n.get('metadata', {}).get('labels', {}).get('nvidia.com/gpu.present') == 'true' for n in nodes)
-    capacity = any(int(n.get('status', {}).get('capacity', {}).get('nvidia.com/gpu', 0) or 0) > 0 for n in nodes)
-    print('true' if gfd else 'false', 'true' if (gfd or capacity) else 'false')
-except Exception:
-    print('false false')
-" 2>/dev/null || echo "false false")
-echo "GPU stack on the control plane cluster: GPU Operator (GFD labels)=${HOST_GFD}, managed=${HOST_MANAGED_GPU}" >&2
-
-HOST_GPU_NODES=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    nodes = json.load(sys.stdin).get('items', [])
-    # Primary: device plugin reporting capacity (gpu-driver-version=default or bare-metal)
-    by_capacity = sum(1 for n in nodes
-                      if int(n.get('status', {}).get('capacity', {}).get('nvidia.com/gpu', 0)) > 0)
-    # Fallback: GKE hardware label set even when gpu-driver-version=disabled and no
-    # device plugin is running (e.g. kai-scheduler / ISV test pattern).
-    by_label = sum(1 for n in nodes
-                   if 'cloud.google.com/gke-accelerator' in n.get('metadata', {}).get('labels', {}))
-    print(max(by_capacity, by_label))
-except Exception:
-    print(0)
-" 2>/dev/null | tr -d '[:space:]' || echo "0")
-
-# MIG: GPU Feature Discovery publishes the nvidia.com/mig.* labels where it runs
-# and MIG is configured. setup.sh does not add them itself, so where GFD does
-# not run (GKE COS) K8sMigConfigCheck finds no MIG nodes and skips.
-
-# ---------------------------------------------------------------------------
-# When the GPU Operator runs on the control plane cluster (HOST_GFD), its
-# toolkit registers the nvidia runtime handler in containerd; make sure the
-# matching 'nvidia' RuntimeClass object exists there too. A cloud-managed device
-# plugin (GKE COS) registers no such handler, so nothing is created then.
-# ---------------------------------------------------------------------------
-if [ "$HOST_GFD" = "true" ]; then
-    if ! kubectl get runtimeclass nvidia &>/dev/null; then
-        echo "Creating 'nvidia' RuntimeClass on host (handler exists in containerd but object was missing)..." >&2
-        kubectl apply -f - >&2 <<'RCEOF'
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: nvidia
-handler: nvidia
-RCEOF
-    else
-        echo "'nvidia' RuntimeClass already present on host." >&2
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Connect and persist tenant kubeconfig.
-# --print outputs the kubeconfig to stdout without starting a background proxy.
-# When the cluster was created with --expose the kubeconfig server field will
-# point to the LoadBalancer IP; otherwise it points to the local port-forward.
+# Connect and persist the tenant's kubeconfig (server: the LoadBalancer).
 # ---------------------------------------------------------------------------
 echo "Connecting to vCluster, saving kubeconfig to ${VCLUSTER_KUBECONFIG_PATH}..." >&2
 # The kubeconfig holds the tenant's admin credentials: owner-only permissions.
 (
     umask 077
-    vcluster connect "$VCLUSTER_NAME" \
-        --driver "$VCLUSTER_DRIVER" \
-        --namespace "$VCLUSTER_NAMESPACE" \
-        --print \
+    vc connect "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" --print \
         2>/dev/null > "$VCLUSTER_KUBECONFIG_PATH"
 )
 chmod 600 "$VCLUSTER_KUBECONFIG_PATH"
-
 export KUBECONFIG="$VCLUSTER_KUBECONFIG_PATH"
 KUBECTL="kubectl"
 
-# When --expose is used the kubeconfig server points to the LoadBalancer IP.
-# GKE (and other clouds) can take 1-3 minutes for health checks to pass and
-# traffic to start flowing after the IP is assigned.  Retry for up to 3 min.
-echo "Waiting for vCluster API to become reachable..." >&2
-API_READY=false
+# Cloud load balancers can take 1-3 minutes to pass health checks.
+echo "Waiting for the tenant's API to become reachable..." >&2
 for i in $(seq 1 36); do
-    if $KUBECTL cluster-info &>/dev/null; then
-        API_READY=true
-        break
-    fi
-    [ "$i" -eq 36 ] && break
-    echo "  Attempt ${i}/36: API not yet reachable; retrying in 5s..." >&2
+    $KUBECTL cluster-info &>/dev/null && break
+    [ "$i" -eq 36 ] && { echo "Error: cannot reach the tenant's API via ${VCLUSTER_KUBECONFIG_PATH} after 3 minutes." >&2; exit 1; }
     sleep 5
 done
-if [ "$API_READY" != "true" ]; then
-    echo "Error: Cannot reach vCluster API via ${VCLUSTER_KUBECONFIG_PATH} after 3 minutes." >&2
-    exit 1
-fi
-echo "Connected to vCluster successfully." >&2
+echo "Connected to the tenant's cluster." >&2
 
 # ---------------------------------------------------------------------------
-# Create the 'nvidia' RuntimeClass in the tenant's cluster.
-# sync.fromHost.runtimeClasses is intentionally disabled so that CNCF
-# conformance tests can freely create and delete RuntimeClass objects without
-# the syncer reconciling them away.  We create the nvidia RuntimeClass here
-# explicitly so GPU workloads can still use runtimeClassName: nvidia.
+# Publish the service account issuer (requirement K8S17-02). The API server
+# serves its discovery document and signing keys to authenticated callers
+# only; copies at the public issuer URL let anyone outside the cluster verify
+# the tenant's tokens, as workload identity federation needs.
 # ---------------------------------------------------------------------------
-echo "Creating 'nvidia' RuntimeClass in tenant's cluster..." >&2
-$KUBECTL apply -f - >/dev/null 2>&1 <<'RCEOF'
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: nvidia
-handler: nvidia
-RCEOF
-echo "  'nvidia' RuntimeClass created in tenant." >&2
-
-# ---------------------------------------------------------------------------
-# Wait for host nodes to sync into the tenant's cluster.
-# Without this, _common.sh sees node_count=0 and the test suite defaults
-# to expecting 4 nodes (the Jinja default(4,true) fires on falsy values).
-# ---------------------------------------------------------------------------
-echo "Waiting for host nodes to sync and become Ready..." >&2
-for i in $(seq 1 60); do
-    READY_NODES=$($KUBECTL get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
-    if [ "${READY_NODES}" -ge 1 ]; then
-        echo "  ${READY_NODES} node(s) Ready." >&2
-        break
+if [ -n "$VCLUSTER_OIDC_ISSUER_URL" ]; then
+    OIDC_DIR="${STATE_PREFIX}-oidc"
+    rm -rf "$OIDC_DIR"
+    mkdir -p "$OIDC_DIR/.well-known" "$OIDC_DIR/openid/v1"
+    $KUBECTL get --raw /.well-known/openid-configuration > "$OIDC_DIR/.well-known/openid-configuration"
+    $KUBECTL get --raw /openid/v1/jwks > "$OIDC_DIR/openid/v1/jwks"
+    _ISSUER=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["issuer"])' "$OIDC_DIR/.well-known/openid-configuration")
+    if [ "$_ISSUER" != "$VCLUSTER_OIDC_ISSUER_URL" ]; then
+        echo "Error: the tenant's API server reports issuer ${_ISSUER}, not ${VCLUSTER_OIDC_ISSUER_URL} (a reused tenant keeps the issuer it was created with)." >&2
+        exit 1
     fi
-    [ "$i" -eq 60 ] && { echo "Warning: no Ready nodes after 5 minutes; continuing." >&2; break; }
-    echo "  Attempt ${i}/60: waiting for nodes..." >&2
-    sleep 5
-done
-
-# ---------------------------------------------------------------------------
-# Remove nvidia.com/gpu:NoSchedule taint from host nodes so that the CNCF
-# conformance e2e BeforeSuite sees all synced nodes as schedulable.
-# vCluster propagates host node spec changes into the tenant on the next sync
-# cycle, so removing the taint here ensures conformance can schedule its pods.
-# Each node and its taint value (GKE uses nvidia.com/gpu=present:NoSchedule)
-# are saved to GPU_TAINT_STATE_FILE so teardown.sh restores the exact taint.
-# ---------------------------------------------------------------------------
-GPU_TAINT_NODES=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get nodes \
-    -o json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    nodes = json.load(sys.stdin).get('items', [])
-    for n in nodes:
-        for t in n.get('spec', {}).get('taints', []) or []:
-            if t.get('key') == 'nvidia.com/gpu' and t.get('effect') == 'NoSchedule':
-                print(n['metadata']['name'] + '\t' + t.get('value', ''))
-                break
-except Exception:
-    pass
-" 2>/dev/null || echo "")
-
-if [ -n "$GPU_TAINT_NODES" ]; then
-    echo "Temporarily removing nvidia.com/gpu:NoSchedule from host nodes for CNCF conformance..." >&2
-    printf '%s\n' "$GPU_TAINT_NODES" > "$GPU_TAINT_STATE_FILE"
-    while IFS=$'\t' read -r node _value; do
-        # Redirect stdout too: kubectl taint writes "node/X untainted" to stdout
-        # which would corrupt the JSON inventory emitted by _common.sh later.
-        if kubectl --kubeconfig="${HOST_KUBECONFIG}" taint node "$node" \
-                nvidia.com/gpu:NoSchedule- >/dev/null 2>&1; then
-            echo "  Removed taint from ${node}." >&2
-        else
-            echo "  Note: taint already absent on ${node}." >&2
-        fi
-    done <<< "$GPU_TAINT_NODES"
-else
-    echo "No nvidia.com/gpu:NoSchedule taints found on host; nothing to remove." >&2
+    echo "Publishing the service account issuer at ${VCLUSTER_OIDC_ISSUER_URL}..." >&2
+    # shellcheck disable=SC2086 # the command is meant to split into words
+    $VCLUSTER_OIDC_PUBLISH_CMD "$OIDC_DIR" >&2
 fi
 
 # ---------------------------------------------------------------------------
-# NVIDIA GPU Operator
-#
-# When HOST_MANAGED_GPU=true the control plane cluster already runs the GPU
-# stack (the GPU Operator, or a cloud's managed drivers and device plugin).
-# Installing the operator in the tenant's cluster would sync a second device
-# plugin, GFD and toolkit onto the same nodes, so nothing is installed. On
-# Shared Nodes the GPU stack belongs to the platform operator and the tenant
-# can neither see nor replace it, so K8sGpuOperatorNamespaceCheck and
-# K8sGpuOperatorPodsCheck fail here by design (requirement K8S25).
-#
-# When HOST_MANAGED_GPU=false (no GPU stack on the control plane cluster) the
-# operator is installed with driver.enabled=false: the kernel driver always
-# belongs to the nodes, and a tenant's cluster cannot load kernel modules.
+# Calico, the tenant's CNI. VXLAN encapsulation works on networks that drop
+# IP-in-IP (GCP among them).
 # ---------------------------------------------------------------------------
-GPU_NODES="$HOST_GPU_NODES"
-
-if [ "$HOST_MANAGED_GPU" = "true" ] && ([ -n "${NGC_API_KEY:-}" ] || [ "${GPU_NODES:-0}" -gt 0 ]); then
-    echo "The control plane cluster manages the GPU stack; not installing the GPU Operator in the tenant's cluster." >&2
-
-elif [ -n "${NGC_API_KEY:-}" ] || [ "${GPU_NODES:-0}" -gt 0 ]; then
-    echo "Installing NVIDIA GPU Operator full stack (${GPU_NODES} GPU node(s) found)..." >&2
-    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia --force-update >&2
-    helm repo update nvidia >&2
-
-    HELM_ARGS=(
-        upgrade --install gpu-operator nvidia/gpu-operator
-        --namespace gpu-operator
-        --create-namespace
-        --set driver.enabled=false
-        --wait
-        --timeout 10m
-    )
-
-    # GKE places the driver under /home/kubernetes/bin/nvidia rather than the
-    # default /usr/local/nvidia.  Override paths so toolkit and device plugin
-    # can locate the host driver libraries.
-    if [ "${CLOUD_PROVIDER:-}" = "gke" ]; then
-        HELM_ARGS+=(
-            --set hostPaths.driverInstallDir=/home/kubernetes/bin/nvidia
-            --set toolkit.installDir=/home/kubernetes/bin/nvidia
-        )
-    fi
-
-    _HELM_VALUES_FILE=""
-    # Install an EXIT trap so the values file (which holds NGC_API_KEY in
-    # plaintext) is removed even if `helm` fails and `set -e` exits the script.
-    # Using a trap is more robust than an `rm` line after helm because any
-    # signal or non-zero exit between mktemp and the explicit rm would
-    # otherwise leak the secret on disk.
-    _cleanup_helm_values_file() {
-        # if/fi, not &&: a failed test would return 1 and trip set -e.
-        if [ -n "${_HELM_VALUES_FILE:-}" ]; then
-            rm -f "$_HELM_VALUES_FILE"
-        fi
-    }
-    trap _cleanup_helm_values_file EXIT
-    if [ -n "${NGC_API_KEY:-}" ]; then
-        # Write the API key to a temp file instead of passing via --set to avoid
-        # exposing the secret in the process argument list (visible in ps aux).
-        _HELM_VALUES_FILE=$(mktemp)
-        chmod 600 "$_HELM_VALUES_FILE"
-        cat >"$_HELM_VALUES_FILE" <<EOF
-imagePullSecret:
-  registry: nvcr.io
-  username: "\$oauthtoken"
-  password: "${NGC_API_KEY}"
+echo "Installing Calico ${CALICO_VERSION} in the tenant's cluster..." >&2
+# Since v3.32 the CRDs ship in their own chart; server-side apply because some
+# exceed the client-side apply size limit.
+helm template calico-crds crd.projectcalico.org.v1 --repo https://docs.tigera.io/calico/charts \
+    --version "$CALICO_VERSION" | $KUBECTL apply --server-side --force-conflicts -f - >/dev/null
+helm upgrade --install calico tigera-operator --repo https://docs.tigera.io/calico/charts \
+    --version "$CALICO_VERSION" --namespace tigera-operator --create-namespace \
+    -f - >/dev/null <<EOF
+installation:
+  cni:
+    type: Calico
+  calicoNetwork:
+    bgp: Disabled
+    ipPools:
+      - cidr: ${VCLUSTER_POD_CIDR}
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
 EOF
-        HELM_ARGS+=(--values "$_HELM_VALUES_FILE")
+
+# ---------------------------------------------------------------------------
+# Join the worker nodes. vcluster token create prints a one-line join command
+# (it carries a bootstrap token that expires in an hour); each node runs it as
+# root, which installs containerd, kubelet and kube-proxy and joins the node.
+# ---------------------------------------------------------------------------
+JOIN_CMD=""
+for node in "${NODES[@]}"; do
+    NODE_NAME=$(node_ssh "$node" hostname)
+    if $KUBECTL get node "$NODE_NAME" &>/dev/null; then
+        echo "Node ${NODE_NAME} already joined." >&2
+        continue
     fi
-
-    KUBECONFIG="$VCLUSTER_KUBECONFIG_PATH" helm "${HELM_ARGS[@]}" >&2
-    _cleanup_helm_values_file
-    trap - EXIT
-
-    # ------------------------------------------------------------------
-    # Preflight: wait for GPU nodes to have nvidia.com/gpu.present=true,
-    # capacity, and driver labels.
-    # ------------------------------------------------------------------
-    if [ "$SKIP_PREFLIGHT" != "true" ]; then
-        echo "Running GPU preflight checks..." >&2
-
-        echo "  Waiting for GPU nodes to be labelled (nvidia.com/gpu.present=true)..." >&2
-        GPU_LABELLED=0
-        for i in {1..30}; do
-            GPU_LABELLED=$($KUBECTL get nodes -l nvidia.com/gpu.present=true \
-                -o name 2>/dev/null | wc -l | tr -d '[:space:]' || echo "0")
-            if [ "${GPU_LABELLED}" -gt 0 ]; then
-                echo "    Found ${GPU_LABELLED} labelled GPU node(s)." >&2
-                break
-            fi
-            echo "    Waiting for GPU Operator to label nodes... (${i}/30)" >&2
-            sleep 10
-        done
-        if [ "${GPU_LABELLED}" -eq 0 ]; then
-            echo "Error: No GPU nodes labelled after 5 minutes." >&2
-            echo "Check GPU Operator: $KUBECTL get pods -n gpu-operator" >&2
-            exit 1
-        fi
-
-        echo "  Waiting for GPU capacity and driver labels..." >&2
-        GPU_READY=false
-        for i in {1..30}; do
-            GPU_CAP=$($KUBECTL get nodes -l nvidia.com/gpu.present=true \
-                -o jsonpath='{.items[0].status.capacity.nvidia\.com/gpu}' 2>/dev/null || echo "")
-            DRIVER_LABEL=$($KUBECTL get nodes -l nvidia.com/gpu.present=true \
-                -o jsonpath='{.items[0].metadata.labels.nvidia\.com/cuda\.driver\.major}' \
-                2>/dev/null || echo "")
-            if [ -n "$GPU_CAP" ] && [ "$GPU_CAP" != "0" ] && [ -n "$DRIVER_LABEL" ]; then
-                echo "    GPU capacity: ${GPU_CAP}, driver major: ${DRIVER_LABEL}" >&2
-                GPU_READY=true
-                break
-            fi
-            echo "    Waiting for GPU Operator to finish setup... (${i}/30)" >&2
-            sleep 10
-        done
-        if [ "$GPU_READY" != "true" ]; then
-            echo "Error: GPU capacity/driver labels not ready after 5 minutes." >&2
-            echo "Check: $KUBECTL get nodes -l nvidia.com/gpu.present=true -o yaml" >&2
-            exit 1
-        fi
+    if [ -z "$JOIN_CMD" ]; then
+        JOIN_CMD=$(vc token create --expires 1h 2>/dev/null | grep -E 'curl .*/node/join' | tail -1)
+        [ -z "$JOIN_CMD" ] && { echo "Error: vcluster token create returned no join command." >&2; exit 1; }
     fi
+    echo "Joining ${NODE_NAME} (${node})..." >&2
+    # The command goes over stdin so the token never appears in a process list.
+    if ! node_ssh "$node" 'sudo bash -s' <<<"$JOIN_CMD" >&2; then
+        echo "Error: joining ${node} failed." >&2
+        exit 1
+    fi
+done
+
+echo "Waiting for ${#NODES[@]} node(s) to become Ready..." >&2
+for i in $(seq 1 60); do
+    READY=$($KUBECTL get nodes --no-headers 2>/dev/null | awk '$2 == "Ready"' | wc -l | tr -d ' ')
+    [ "$READY" -ge "${#NODES[@]}" ] && { echo "${READY} node(s) Ready." >&2; break; }
+    [ "$i" -eq 60 ] && { echo "Error: only ${READY} of ${#NODES[@]} node(s) Ready after 10 minutes." >&2; $KUBECTL get nodes >&2 || true; exit 1; }
+    sleep 10
+done
+
+# ---------------------------------------------------------------------------
+# NVIDIA GPU Operator, owned by the tenant: it installs the driver, container
+# toolkit, device plugin, GPU Feature Discovery and DCGM exporter on the
+# tenant's nodes (requirement K8S25).
+# ---------------------------------------------------------------------------
+echo "Installing NVIDIA GPU Operator ${GPU_OPERATOR_VERSION} in the tenant's cluster..." >&2
+$KUBECTL create namespace gpu-operator --dry-run=client -o yaml | $KUBECTL apply -f - >/dev/null
+$KUBECTL label namespace gpu-operator pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+helm upgrade --install gpu-operator gpu-operator --repo https://helm.ngc.nvidia.com/nvidia \
+    --version "$GPU_OPERATOR_VERSION" --namespace gpu-operator >/dev/null
+
+# The driver container builds the kernel module on each node, which takes a
+# few minutes; wait until every node advertises its GPUs.
+echo "Waiting for the GPUs to be allocatable (driver build included)..." >&2
+for i in $(seq 1 90); do
+    GPU_NODES=$($KUBECTL get nodes -o json | python3 -c '
+import json, sys
+nodes = json.load(sys.stdin)["items"]
+print(sum(1 for n in nodes if int(n["status"].get("allocatable", {}).get("nvidia.com/gpu", "0") or 0) > 0))')
+    [ "$GPU_NODES" -ge "${#NODES[@]}" ] && { echo "GPUs allocatable on ${GPU_NODES} node(s)." >&2; break; }
+    [ "$i" -eq 90 ] && { echo "Error: GPUs allocatable on ${GPU_NODES} of ${#NODES[@]} node(s) after 30 minutes." >&2; $KUBECTL get pods -n gpu-operator >&2 || true; exit 1; }
+    sleep 20
+done
+
+# ---------------------------------------------------------------------------
+# NVIDIA DRA driver for GPUs (requirement K8S24): publishes the GPUs as DRA
+# devices (DeviceClass gpu.nvidia.com) next to the device plugin's
+# nvidia.com/gpu resource. Its chart allows both on one node only with
+# gpuResourcesEnabledOverride, because either can hand out a GPU the other
+# already gave away. That cannot happen in this suite, which runs one GPU
+# workload at a time; a production cluster keeps DRA and the device plugin on
+# separate nodes, or runs DRA alone once DRAExtendedResource (KEP 5004) is GA.
+# ComputeDomains (IMEX, for NVLink-connected nodes) stay off.
+# ---------------------------------------------------------------------------
+echo "Installing NVIDIA DRA driver ${DRA_DRIVER_VERSION} in the tenant's cluster..." >&2
+if helm upgrade --install nvidia-dra-driver-gpu nvidia-dra-driver-gpu --repo https://helm.ngc.nvidia.com/nvidia \
+        --version "$DRA_DRIVER_VERSION" --namespace nvidia-dra-driver-gpu --create-namespace \
+        --set nvidiaDriverRoot=/run/nvidia/driver \
+        --set resources.computeDomains.enabled=false \
+        --set gpuResourcesEnabledOverride=true >/dev/null; then
+    for i in $(seq 1 30); do
+        DRA_NODES=$($KUBECTL get resourceslices -o json 2>/dev/null | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+print(len({s["spec"].get("nodeName") for s in items if s["spec"].get("driver") == "gpu.nvidia.com"}))' 2>/dev/null || echo 0)
+        [ "$DRA_NODES" -ge "${#NODES[@]}" ] && { echo "GPUs published as DRA devices on ${DRA_NODES} node(s)." >&2; break; }
+        [ "$i" -eq 30 ] && echo "  Warning: DRA devices on ${DRA_NODES} of ${#NODES[@]} node(s) after 5 minutes." >&2
+        sleep 10
+    done
 else
-    echo "No GPU nodes found and NGC_API_KEY not set; skipping GPU Operator install." >&2
+    echo "  Warning: DRA driver install failed (K8sDraCheck will fail)." >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Install Kubeflow MPI Operator in the tenant's cluster so that
-# K8sNcclMultiNodeWorkload can run MPIJobs across multiple GPU nodes.
-# The manifest is bundled in the provider directory to avoid runtime fetches.
+# Kubeflow MPI Operator, for K8sNcclMultiNodeWorkload's MPIJobs. The manifest
+# is bundled in the provider directory to avoid runtime fetches.
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MPI_OPERATOR_MANIFEST="${SCRIPT_DIR}/../../manifests/mpi-operator-v0.5.0.yaml"
-if [ -f "$MPI_OPERATOR_MANIFEST" ]; then
-    echo "Installing Kubeflow MPI Operator in tenant's cluster..." >&2
-    # Server-side apply is required because the MPIJob CRD's OpenAPI schema is
-    # large enough that client-side apply hits the 256 KiB annotation limit
-    # (kubectl.kubernetes.io/last-applied-configuration). With --server-side the
-    # apiserver tracks ownership directly and no last-applied annotation is set.
-    if $KUBECTL apply --server-side --force-conflicts -f "$MPI_OPERATOR_MANIFEST" >/dev/null 2>&1; then
-        echo "  MPI Operator installed (mpijobs.kubeflow.org CRD registered)." >&2
-    else
-        echo "  Warning: MPI Operator install failed (multi-node NCCL will skip)." >&2
-    fi
+echo "Installing Kubeflow MPI Operator in the tenant's cluster..." >&2
+# Server-side apply: the MPIJob CRD is too large for the last-applied annotation.
+if $KUBECTL apply --server-side --force-conflicts -f "$MPI_OPERATOR_MANIFEST" >/dev/null 2>&1; then
+    echo "  MPI Operator installed." >&2
 else
-    echo "  Warning: MPI Operator manifest not found at ${MPI_OPERATOR_MANIFEST}; skipping." >&2
+    echo "  Warning: MPI Operator install failed (multi-node NCCL will skip)." >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Create NGC image pull secret in the default namespace so that
-# nvcr.io/nvidia/hpc-benchmarks (used by K8sNcclMultiNodeWorkload) can
-# be pulled without ImagePullBackOff.  Patching the default ServiceAccount
-# lets Kubernetes inject the secret automatically into all pods.
+# NGC image pull secret in the default namespace, for nvcr.io images such as
+# hpc-benchmarks; the default ServiceAccount injects it into every pod.
 # ---------------------------------------------------------------------------
 if [ -n "${NGC_API_KEY:-}" ]; then
-    echo "Creating NGC image pull secret for hpc-benchmarks in default namespace..." >&2
+    echo "Creating NGC image pull secret in the default namespace..." >&2
     $KUBECTL create secret docker-registry ngc-hpc-pull-secret \
-        --docker-server=nvcr.io \
-        --docker-username='$oauthtoken' \
-        --docker-password="${NGC_API_KEY}" \
+        --docker-server=nvcr.io --docker-username='$oauthtoken' --docker-password="${NGC_API_KEY}" \
         -n default --dry-run=client -o yaml 2>/dev/null \
         | $KUBECTL apply -f - >/dev/null 2>&1 \
         && $KUBECTL patch serviceaccount default -n default \
@@ -575,59 +432,52 @@ fi
 # ---------------------------------------------------------------------------
 # API network ACL (K8sApiNetworkAclCheck, requirement K8S15).
 #
-# The tenant's API LoadBalancer admits only VCLUSTER_API_ALLOWED_CIDRS (applied
-# above). Write the unauthorized probe next to the tenant's kubeconfig: it
-# connects from a pod in the cluster, which is outside the allowlist, and must
-# be blocked. Any HTTP answer, a 401 included, counts as reachable, so an
-# authentication error can never pass for a network ACL. The probe bounds its
-# own run time well inside the check's probe_timeout_s and exits 127 on any
-# failure of its own, so a hang can never pass as "blocked".
+# The nodes are on the allowlist, so the probe cannot run in the tenant's own
+# cluster. It runs from a pod on the control plane cluster instead, whose
+# egress address is outside the allowlist, and must be blocked. Any HTTP
+# answer, a 401 included, counts as reachable, so an authentication error can
+# never pass for a network ACL. The probe bounds its own run time well inside
+# the check's probe_timeout_s and exits 127 on any failure of its own.
 # ---------------------------------------------------------------------------
 ACL_PROBE="${VCLUSTER_KUBECONFIG_PATH}.acl-probe.sh"
-rm -f "$ACL_PROBE" /tmp/vcluster-isv-lb-ip.txt /tmp/vcluster-isv-acl-probe.sh
-if [ "${VCLUSTER_EXPOSE:-false}" = "true" ]; then
-    # Clouds publish an IP (GKE, AKS) or a hostname (AWS load balancers).
-    _ACL_LB=$(kubectl --kubeconfig="${HOST_KUBECONFIG}" get svc \
-        "${VCLUSTER_NAME}" -n "${VCLUSTER_NAMESPACE}" \
-        -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-    if [ -n "$_ACL_LB" ]; then
-        echo "vCluster LoadBalancer: ${_ACL_LB}" >&2
-        (
-            umask 077
-            {
-                echo '#!/usr/bin/env bash'
-                echo '# Unauthorized probe for K8sApiNetworkAclCheck, written by setup.sh. Connects to'
-                echo "# the tenant's API LoadBalancer from a pod, which is outside the allowlist."
-                echo '# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.'
-                printf 'LB=%q\n' "$_ACL_LB"
-                cat <<'PROBEEOF'
-K=${KUBECTL:-kubectl}
+rm -f "$ACL_PROBE"
+# Clouds publish an IP (GKE, AKS) or a hostname (AWS load balancers).
+_ACL_LB=$(kubectl --kubeconfig="$HOST_KUBECONFIG" get svc "$VCLUSTER_NAME" -n "$VCLUSTER_NAMESPACE" \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+if [ -n "$_ACL_LB" ]; then
+    echo "Tenant API LoadBalancer: ${_ACL_LB}" >&2
+    (
+        umask 077
+        {
+            echo '#!/usr/bin/env bash'
+            echo '# Unauthorized probe for K8sApiNetworkAclCheck, written by setup.sh. Connects to'
+            echo "# the tenant's API LoadBalancer from a pod on the control plane cluster, whose"
+            echo '# egress address is outside the allowlist.'
+            echo '# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.'
+            printf 'LB=%q\n' "$_ACL_LB"
+            printf 'K=(kubectl --kubeconfig=%q --context=%q -n %q)\n' "$HOST_KUBECONFIG" "$HOST_CONTEXT" "$VCLUSTER_NAMESPACE"
+            cat <<'PROBEEOF'
 POD="acl-probe-$$"
-# shellcheck disable=SC2086 # KUBECTL may carry flags such as --kubeconfig
-if ! $K run "$POD" --restart=Never --image=curlimages/curl:8.11.1 --request-timeout=15s --command -- \
+if ! "${K[@]}" run "$POD" --restart=Never --image=curlimages/curl:8.11.1 --request-timeout=15s --command -- \
         sh -c "curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" >/dev/null 2>&1; then
     echo "probe failed: could not create pod ${POD}"; exit 127
 fi
 OUT=""
-# shellcheck disable=SC2086
-if $K wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${POD}" --timeout=60s >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    OUT=$($K logs "$POD" --request-timeout=10s 2>/dev/null)
+if "${K[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${POD}" --timeout=60s >/dev/null 2>&1; then
+    OUT=$("${K[@]}" logs "$POD" --request-timeout=10s 2>/dev/null)
 fi
-# shellcheck disable=SC2086
-$K delete pod "$POD" --ignore-not-found --wait=false --request-timeout=10s >/dev/null 2>&1
+"${K[@]}" delete pod "$POD" --ignore-not-found --wait=false --request-timeout=10s >/dev/null 2>&1
 case "$OUT" in
-    *" rc=0"*) echo "reachable from a pod: ${OUT}"; exit 0 ;;
-    *" rc=7"* | *" rc=28"*) echo "blocked from a pod: ${OUT}"; exit 1 ;;
+    *" rc=0"*) echo "reachable from the control plane cluster: ${OUT}"; exit 0 ;;
+    *" rc=7"* | *" rc=28"*) echo "blocked from the control plane cluster: ${OUT}"; exit 1 ;;
     *) echo "probe failed: ${OUT:-no result within the time limit}"; exit 127 ;;
 esac
 PROBEEOF
-            } > "$ACL_PROBE"
-        )
-        chmod 700 "$ACL_PROBE"
-    else
-        echo "  Warning: LoadBalancer address not available; K8sApiNetworkAclCheck will fail." >&2
-    fi
+        } > "$ACL_PROBE"
+    )
+    chmod 700 "$ACL_PROBE"
+else
+    echo "  Warning: LoadBalancer address not available; K8sApiNetworkAclCheck will fail." >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -636,36 +486,5 @@ fi
 CLUSTER_NAME=$($KUBECTL config current-context 2>/dev/null || echo "$VCLUSTER_NAME")
 DEFAULT_GPU_NS="gpu-operator"
 REQUIRE_JQ="true"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# _common.sh sets runtime_class="nvidia" whenever a nvidia RuntimeClass object
-# exists in the tenant. On GKE COS, GPU pods get their devices from the device
-# plugin (and through CDI when the GPU Operator runs), so test pods need no
-# runtimeClassName: nvidia; without the GPU Operator's toolkit containerd has no
-# nvidia handler at all. Without the GPU Operator (HOST_GFD=false), GPU Feature
-# Discovery does not run either, so there are no driver labels to read a version
-# from: the inventory reports none and K8sDriverVersionCheck does not compare.
-# The NVIDIA-label checks are left to fail; nothing stands in for GFD's labels.
-if [ "${CLOUD_PROVIDER:-}" = "gke" ]; then
-    _COMMON_JSON=$(
-        CLUSTER_NAME="$CLUSTER_NAME"
-        DEFAULT_GPU_NS="$DEFAULT_GPU_NS"
-        REQUIRE_JQ="$REQUIRE_JQ"
-        # shellcheck source=_common.sh
-        source "$SCRIPT_DIR/_common.sh"
-    )
-    echo "$_COMMON_JSON" | HOST_GFD="$HOST_GFD" python3 -c "
-import json, os, sys
-data = json.load(sys.stdin)
-k8s = data.setdefault('kubernetes', {})
-k8s['runtime_class'] = ''
-if os.environ.get('HOST_GFD') != 'true':
-    # No GFD driver labels: report no version rather than the runner's own.
-    k8s['driver_version'] = ''
-print(json.dumps(data, indent=2))
-"
-else
-    # shellcheck source=_common.sh
-    source "$SCRIPT_DIR/_common.sh"
-fi
+# shellcheck source=_common.sh
+source "$SCRIPT_DIR/_common.sh"

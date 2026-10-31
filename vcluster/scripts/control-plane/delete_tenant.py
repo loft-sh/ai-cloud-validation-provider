@@ -18,7 +18,8 @@
 """Delete a tenant (vCluster instance).
 
 Teardown counterpart to create_tenant.py. Removes the vCluster instance from
-the control plane cluster namespace using the vcluster CLI.
+the control plane cluster namespace using the vcluster CLI, logged in to the
+vCluster Platform the tenant was connected to.
 
 Required JSON output:
 {
@@ -39,6 +40,8 @@ import os
 import subprocess
 import sys
 from typing import Any
+
+from _platform import vcluster_cli
 
 DEMO_MODE = os.environ.get("ISVCTL_DEMO_MODE") == "1"
 
@@ -83,18 +86,19 @@ def main() -> int:
     try:
         env = _kubeconfig_env()
 
-        rc, stdout, stderr = _run(
-            [
-                "vcluster",
-                "delete",
-                args.group_name,
-                "--driver",
-                os.environ.get("VCLUSTER_DRIVER") or "helm",
-                "--namespace",
-                ns,
-            ],
-            env,
-        )
+        with vcluster_cli(env) as vc:
+            rc, stdout, stderr = _run(
+                [
+                    *vc,
+                    "delete",
+                    args.group_name,
+                    "--driver",
+                    os.environ.get("VCLUSTER_DRIVER") or "helm",
+                    "--namespace",
+                    ns,
+                ],
+                env,
+            )
 
         # vcluster delete exits non-zero if the cluster doesn't exist; treat
         # "not found" as a successful teardown.  The vCluster CLI may print the
