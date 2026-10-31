@@ -53,8 +53,12 @@ SSH_CMD+=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-
 # ---------------------------------------------------------------------------
 # Reset the worker nodes while the tenant still serves the node script: its
 # --reset-only mode removes kubelet, containerd and the other node components.
+# It leaves the tenant's data behind, so a reset node also loses the volumes of
+# the tenant's local-path StorageClass and the pod logs. containerd's image
+# cache and the NVIDIA driver the GPU Operator loaded stay on the node.
 # Best effort: a node that is gone or unreachable is reported and skipped.
 # ---------------------------------------------------------------------------
+NODE_DATA_DIRS="/opt/local-path-provisioner /var/log/pods /var/log/containers"
 if [ "${#NODES[@]}" -gt 0 ] && [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
     JOIN_CMD=$(KUBECONFIG="$VCLUSTER_KUBECONFIG_PATH" vc token create --expires 1h 2>/dev/null | grep -E 'curl .*/node/join' | tail -1 || true)
     if [ -n "$JOIN_CMD" ]; then
@@ -62,10 +66,12 @@ if [ "${#NODES[@]}" -gt 0 ] && [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
         for node in "${NODES[@]}"; do
             echo "Resetting node ${node}..." >&2
             # "curl ... | sh -s": pipefail makes a failed download fail the reset.
-            if "${SSH_CMD[@]}" "$node" 'sudo bash -o pipefail -s' <<<"$RESET_CMD" >/dev/null 2>&1; then
+            # The data goes only after a reset, when no pod uses it any more.
+            if "${SSH_CMD[@]}" "$node" 'sudo bash -o pipefail -s' <<<"$RESET_CMD" >/dev/null 2>&1 &&
+                "${SSH_CMD[@]}" "$node" "sudo rm -rf ${NODE_DATA_DIRS}" >/dev/null 2>&1; then
                 echo "  ${node} reset." >&2
             else
-                echo "  Warning: could not reset ${node}." >&2
+                echo "  Warning: could not reset ${node}; it may still hold the tenant's data." >&2
             fi
         done
     else
