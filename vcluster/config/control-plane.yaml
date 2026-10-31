@@ -19,13 +19,19 @@
 # Imports the provider-agnostic control-plane suite from an ai-cloud-validation
 # checkout and wires it to the vCluster scripts in ../scripts/control-plane/.
 # The mapping is:
-#   "tenant"     = a vCluster instance in VCLUSTER_NAMESPACE on the control plane cluster
+#   "tenant"     = a vCluster instance with Private Nodes in VCLUSTER_NAMESPACE on the
+#                  control plane cluster, connected to vCluster Platform for its license
 #   "access_key" = a Kubernetes ServiceAccount + bound token in that namespace
 #
 # Environment variables:
+#   VCLUSTER_PLATFORM_HOST    - vCluster Platform URL (required; Private Nodes is a
+#                               vCluster Free tier feature licensed through it)
+#   VCLUSTER_PLATFORM_ACCESS_KEY - access key for that Platform (required, or
+#                               VCLUSTER_PLATFORM_ACCESS_KEY_FILE)
+#   VCLUSTER_PLATFORM_INSECURE - "true" if the Platform's certificate is self-signed
 #   VCLUSTER_DRIVER           - vcluster CLI driver (default: helm)
 #   VCLUSTER_VERSION          - vCluster chart version for created tenants
-#                               (default: 0.37.5)
+#                               (default: 0.37.6)
 #   VCLUSTER_NAMESPACE        - namespace where vCluster instances live
 #                               (default: vcluster-isv-validation)
 #   VCLUSTER_HOST_KUBECONFIG  - path to the control plane cluster kubeconfig
