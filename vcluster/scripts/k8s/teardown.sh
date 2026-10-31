@@ -37,10 +37,18 @@ VCLUSTER_CLI_CONFIG="${STATE_PREFIX}-cli.json"
 read -r -a NODES <<<"${VCLUSTER_NODES:-}"
 
 vc() { vcluster --config "$VCLUSTER_CLI_CONFIG" "$@"; }
-SSH_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
-[ -n "${VCLUSTER_NODE_SSH_KEY:-}" ] && SSH_CMD+=(-i "$VCLUSTER_NODE_SSH_KEY" -o IdentitiesOnly=yes)
+# The control plane cluster's context that setup.sh used, so teardown reaches
+# the same cluster even if the current context changed during the run.
+HOST_CONTEXT_FILE="${STATE_PREFIX}-host-context"
+HOST_CONTEXT=$(cat "$HOST_CONTEXT_FILE" 2>/dev/null || true)
+HOST_CTX_ARGS=()
+[ -n "$HOST_CONTEXT" ] && HOST_CTX_ARGS=(--context "$HOST_CONTEXT")
+# User options first: ssh keeps the first value it gets for each option.
+SSH_CMD=(ssh)
 # shellcheck disable=SC2206 # options are meant to split into words
 [ -n "${VCLUSTER_NODE_SSH_OPTS:-}" ] && SSH_CMD+=(${VCLUSTER_NODE_SSH_OPTS})
+SSH_CMD+=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+[ -n "${VCLUSTER_NODE_SSH_KEY:-}" ] && SSH_CMD+=(-i "$VCLUSTER_NODE_SSH_KEY" -o IdentitiesOnly=yes)
 
 # ---------------------------------------------------------------------------
 # Reset the worker nodes while the tenant still serves the node script: its
@@ -53,7 +61,8 @@ if [ "${#NODES[@]}" -gt 0 ] && [ -f "$VCLUSTER_KUBECONFIG_PATH" ]; then
         RESET_CMD="${JOIN_CMD% -} -s -- --reset-only"
         for node in "${NODES[@]}"; do
             echo "Resetting node ${node}..." >&2
-            if "${SSH_CMD[@]}" "$node" 'sudo bash -s' <<<"$RESET_CMD" >/dev/null 2>&1; then
+            # "curl ... | sh -s": pipefail makes a failed download fail the reset.
+            if "${SSH_CMD[@]}" "$node" 'sudo bash -o pipefail -s' <<<"$RESET_CMD" >/dev/null 2>&1; then
                 echo "  ${node} reset." >&2
             else
                 echo "  Warning: could not reset ${node}." >&2
@@ -66,27 +75,37 @@ fi
 
 # ---------------------------------------------------------------------------
 # Delete the tenant. Uses the ambient KUBECONFIG (control plane cluster).
-# vcluster delete reports a control plane cluster it cannot reach (expired
-# credentials, say) as "couldn't find vcluster", so check that first: an
-# unreachable cluster must fail the teardown, not read as an absent tenant.
+# vcluster delete reports a lookup that failed (expired credentials, no
+# permission) as "couldn't find vcluster", like a tenant that is gone, so an
+# unreachable cluster fails the teardown here, and the API confirms below that
+# nothing of the tenant is left.
 # ---------------------------------------------------------------------------
-if ! kubectl get --raw /version >/dev/null 2>&1; then
+if ! kubectl "${HOST_CTX_ARGS[@]}" get --raw /version >/dev/null 2>&1; then
     echo "Error: cannot reach the control plane cluster with the current KUBECONFIG; the tenant was not deleted." >&2
     exit 1
 fi
 echo "Deleting vCluster '${VCLUSTER_NAME}' from namespace '${VCLUSTER_NAMESPACE}'..." >&2
 DELETE_RC=0
-DELETE_OUT=$(vc delete "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" 2>&1) || DELETE_RC=$?
-if [ "$DELETE_RC" -ne 0 ]; then
-    if echo "$DELETE_OUT" | grep -qi "not found\|does not exist\|couldn't find"; then
-        echo "vCluster '${VCLUSTER_NAME}' was already absent; nothing to do." >&2
-    else
-        echo "Error: vcluster delete failed (exit ${DELETE_RC}):" >&2
-        echo "$DELETE_OUT" >&2
+DELETE_OUT=$(vc "${HOST_CTX_ARGS[@]}" delete "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" 2>&1) || DELETE_RC=$?
+if [ "$DELETE_RC" -ne 0 ] && ! echo "$DELETE_OUT" | grep -qi "not found\|does not exist\|couldn't find"; then
+    echo "Error: vcluster delete failed (exit ${DELETE_RC}):" >&2
+    echo "$DELETE_OUT" >&2
+    exit 1
+fi
+for i in $(seq 1 24); do
+    if ! LEFT=$(kubectl "${HOST_CTX_ARGS[@]}" get statefulsets,deployments,services -n "$VCLUSTER_NAMESPACE" \
+            -l "release=${VCLUSTER_NAME}" -o name 2>/dev/null); then
+        echo "Error: could not confirm that vCluster '${VCLUSTER_NAME}' is gone (kubectl get failed)." >&2
         exit 1
     fi
-else
+    [ -z "$LEFT" ] && break
+    [ "$i" -eq 24 ] && { echo "Error: vCluster '${VCLUSTER_NAME}' still has resources after 2 minutes:" >&2; echo "$LEFT" >&2; exit 1; }
+    sleep 5
+done
+if [ "$DELETE_RC" -eq 0 ]; then
     echo "vCluster deleted." >&2
+else
+    echo "vCluster '${VCLUSTER_NAME}' was already absent; nothing to do." >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -96,6 +115,6 @@ fi
 # VCLUSTER_OIDC_PUBLISH_CMD put them.
 # ---------------------------------------------------------------------------
 rm -f "$VCLUSTER_KUBECONFIG_PATH" "${VCLUSTER_KUBECONFIG_PATH}.acl-probe.sh" \
-    "${STATE_PREFIX}-values.yaml" "$VCLUSTER_CLI_CONFIG"
+    "${STATE_PREFIX}-values.yaml" "$VCLUSTER_CLI_CONFIG" "$HOST_CONTEXT_FILE"
 rm -rf "${STATE_PREFIX}-oidc"
 echo "Teardown complete." >&2

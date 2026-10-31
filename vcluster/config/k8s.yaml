@@ -98,9 +98,12 @@ tests:
           # tenant's kubeconfig, connects from a pod on the control plane
           # cluster, whose egress address is outside the allowlist, and must be
           # blocked at the network layer. It exits 0 on any HTTP answer, a 401
-          # included, so an authentication error never counts as an ACL. It
-          # finishes within 95 s and exits 127 if it cannot get a result, which
-          # the check reports as a failure, so a hang never passes as blocked.
+          # included, so an authentication error never counts as an ACL. The
+          # same pod must first reach the API server through its ClusterIP
+          # Service, which the source ranges do not cover, so a pod without
+          # network access never passes as blocked. The probe finishes within
+          # 95 s and exits 127 if it cannot get a result, which the check
+          # reports as a failure, so a hang never passes as blocked.
           probe_timeout_s: 120
           commands:
             unauthorized_probe: "bash ${VCLUSTER_KUBECONFIG_PATH:-/tmp/vcluster-isv-validation.kubeconfig}.acl-probe.sh"
