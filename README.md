@@ -13,7 +13,7 @@ and has its own registry entry.
 
 | Provider | Tenancy model | Suites | Validated against |
 |---|---|---|---|
-| [`vcluster`](vcluster/) | Shared Nodes | `k8s`, `control-plane` | 1.0.0 ([results](vcluster/README.md#results)) |
+| [`vcluster`](vcluster/) | Private Nodes | `k8s`, `control-plane` | 1.0.0 ([results](vcluster/README.md#results)) |
 
 ## Reproducing the results
 
