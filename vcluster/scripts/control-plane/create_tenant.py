@@ -85,6 +85,11 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         return 0
 
+    # Named before creating: if the create succeeds but this step then fails,
+    # delete_tenant still gets the name and removes the tenant.
+    result["tenant_name"] = tenant_name
+    result["tenant_id"] = tenant_name
+
     try:
         env = _kubeconfig_env()
 
@@ -146,8 +151,6 @@ def main() -> int:
             print(json.dumps(result, indent=2))
             return 1
 
-        result["tenant_name"] = tenant_name
-        result["tenant_id"] = tenant_name
         result["success"] = True
 
     except Exception as exc:  # pylint: disable=broad-except

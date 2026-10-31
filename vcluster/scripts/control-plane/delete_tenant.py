@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 from _platform import vcluster_cli
@@ -85,6 +86,7 @@ def main() -> int:
 
     try:
         env = _kubeconfig_env()
+        driver = os.environ.get("VCLUSTER_DRIVER") or "helm"
 
         with vcluster_cli(env) as vc:
             rc, stdout, stderr = _run(
@@ -93,7 +95,7 @@ def main() -> int:
                     "delete",
                     args.group_name,
                     "--driver",
-                    os.environ.get("VCLUSTER_DRIVER") or "helm",
+                    driver,
                     "--namespace",
                     ns,
                 ],
@@ -115,6 +117,40 @@ def main() -> int:
             result["error"] = f"vcluster delete failed: {stderr}"
             print(json.dumps(result, indent=2))
             return 1
+
+        # vcluster delete reports a lookup that failed (unreachable cluster, no
+        # permission) as "couldn't find" too, so with the helm driver confirm
+        # with the API that none of the tenant's workloads or Services is left.
+        if driver == "helm":
+            left = ""
+            for _ in range(18):
+                rc_get, left, _ = _run(
+                    [
+                        "kubectl",
+                        "get",
+                        "statefulsets,deployments,services",
+                        "--namespace",
+                        ns,
+                        "--selector",
+                        f"release={args.group_name}",
+                        "--output",
+                        "name",
+                    ],
+                    env,
+                )
+                if rc_get != 0:
+                    result["error"] = (
+                        f"could not confirm that vCluster '{args.group_name}' is gone (kubectl get failed)"
+                    )
+                    print(json.dumps(result, indent=2))
+                    return 1
+                if not left:
+                    break
+                time.sleep(5)
+            else:
+                result["error"] = f"vCluster '{args.group_name}' still has resources in '{ns}': {left}"
+                print(json.dumps(result, indent=2))
+                return 1
 
         result["resources_deleted"] = [f"vcluster/{args.group_name}"]
         result["message"] = (

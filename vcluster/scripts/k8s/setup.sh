@@ -120,10 +120,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The vcluster CLI keeps its Platform login in its own config, never ~/.vcluster.
 vc() { vcluster --config "$VCLUSTER_CLI_CONFIG" "$@"; }
-SSH_CMD=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
-[ -n "${VCLUSTER_NODE_SSH_KEY:-}" ] && SSH_CMD+=(-i "$VCLUSTER_NODE_SSH_KEY" -o IdentitiesOnly=yes)
+# Calls to the control plane cluster use the context saved above, even if the
+# current context changes during the run; teardown.sh reads it back from here.
+HOST_CONTEXT_FILE="${STATE_PREFIX}-host-context"
+vc_host() { vc --context "$HOST_CONTEXT" "$@"; }
+host_kubectl() { kubectl --kubeconfig="$HOST_KUBECONFIG" --context="$HOST_CONTEXT" "$@"; }
+# User options first: ssh keeps the first value it gets for each option.
+SSH_CMD=(ssh)
 # shellcheck disable=SC2206 # options are meant to split into words
 [ -n "${VCLUSTER_NODE_SSH_OPTS:-}" ] && SSH_CMD+=(${VCLUSTER_NODE_SSH_OPTS})
+SSH_CMD+=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+[ -n "${VCLUSTER_NODE_SSH_KEY:-}" ] && SSH_CMD+=(-i "$VCLUSTER_NODE_SSH_KEY" -o IdentitiesOnly=yes)
 node_ssh() { local dest="$1"; shift; "${SSH_CMD[@]}" "$dest" "$@"; }
 
 # ---------------------------------------------------------------------------
@@ -212,9 +219,10 @@ values["controlPlane"]["distro"] = {"k8s": {"apiServer": {"extraArgs": api_serve
 with open(path, "w") as f:
     json.dump(values, f, indent=2)
 PYEOF
+printf '%s\n' "$HOST_CONTEXT" > "$HOST_CONTEXT_FILE"
 
 tenant_status() {
-    vc list --driver helm --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null | python3 -c "
+    vc_host list --driver helm --namespace "$VCLUSTER_NAMESPACE" --output json 2>/dev/null | python3 -c "
 import json, sys
 items = json.load(sys.stdin) or []
 match = next((v for v in items if v.get('Name') == sys.argv[1]), None)
@@ -227,14 +235,14 @@ if [ -z "$EXISTING_STATUS" ]; then
     echo "Creating vCluster '${VCLUSTER_NAME}' (chart ${VCLUSTER_VERSION}, Private Nodes) in namespace '${VCLUSTER_NAMESPACE}'..." >&2
     # --expose puts the LoadBalancer address in the API server certificate, so
     # nodes and kubeconfigs can use it; --add connects the tenant to the Platform.
-    vc create "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" \
+    vc_host create "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" \
         --chart-version "$VCLUSTER_VERSION" --connect=false --add --expose \
         -f "$VALUES_FILE" >&2
 else
     echo "vCluster '${VCLUSTER_NAME}' already exists (status: ${EXISTING_STATUS}), reusing." >&2
     # A reused tenant keeps the allowlist it was created with: apply the current one.
     _RANGES_JSON=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1].split(",")))' "$VCLUSTER_API_ALLOWED_CIDRS")
-    kubectl --kubeconfig="$HOST_KUBECONFIG" -n "$VCLUSTER_NAMESPACE" patch svc "$VCLUSTER_NAME" \
+    host_kubectl -n "$VCLUSTER_NAMESPACE" patch svc "$VCLUSTER_NAME" \
         --type merge -p "{\"spec\":{\"loadBalancerSourceRanges\":${_RANGES_JSON}}}" >/dev/null
 fi
 
@@ -253,7 +261,7 @@ echo "Connecting to vCluster, saving kubeconfig to ${VCLUSTER_KUBECONFIG_PATH}..
 # The kubeconfig holds the tenant's admin credentials: owner-only permissions.
 (
     umask 077
-    vc connect "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" --print \
+    vc_host connect "$VCLUSTER_NAME" --driver helm --namespace "$VCLUSTER_NAMESPACE" --print \
         2>/dev/null > "$VCLUSTER_KUBECONFIG_PATH"
 )
 chmod 600 "$VCLUSTER_KUBECONFIG_PATH"
@@ -322,7 +330,8 @@ EOF
 # ---------------------------------------------------------------------------
 JOIN_CMD=""
 for node in "${NODES[@]}"; do
-    NODE_NAME=$(node_ssh "$node" hostname)
+    # Node names are the lowercased hostname.
+    NODE_NAME=$(node_ssh "$node" hostname | tr '[:upper:]' '[:lower:]')
     if $KUBECTL get node "$NODE_NAME" &>/dev/null; then
         echo "Node ${NODE_NAME} already joined." >&2
         continue
@@ -333,7 +342,8 @@ for node in "${NODES[@]}"; do
     fi
     echo "Joining ${NODE_NAME} (${node})..." >&2
     # The command goes over stdin so the token never appears in a process list.
-    if ! node_ssh "$node" 'sudo bash -s' <<<"$JOIN_CMD" >&2; then
+    # It is "curl ... | sh -": pipefail makes a failed download fail the join.
+    if ! node_ssh "$node" 'sudo bash -o pipefail -s' <<<"$JOIN_CMD" >&2; then
         echo "Error: joining ${node} failed." >&2
         exit 1
     fi
@@ -341,7 +351,7 @@ done
 
 echo "Waiting for ${#NODES[@]} node(s) to become Ready..." >&2
 for i in $(seq 1 60); do
-    READY=$($KUBECTL get nodes --no-headers 2>/dev/null | awk '$2 == "Ready"' | wc -l | tr -d ' ')
+    READY=$($KUBECTL get nodes --no-headers 2>/dev/null | awk '$2 == "Ready"' | wc -l | tr -d ' ') || READY=0
     [ "$READY" -ge "${#NODES[@]}" ] && { echo "${READY} node(s) Ready." >&2; break; }
     [ "$i" -eq 60 ] && { echo "Error: only ${READY} of ${#NODES[@]} node(s) Ready after 10 minutes." >&2; $KUBECTL get nodes >&2 || true; exit 1; }
     sleep 10
@@ -362,10 +372,10 @@ helm upgrade --install gpu-operator gpu-operator --repo https://helm.ngc.nvidia.
 # few minutes; wait until every node advertises its GPUs.
 echo "Waiting for the GPUs to be allocatable (driver build included)..." >&2
 for i in $(seq 1 90); do
-    GPU_NODES=$($KUBECTL get nodes -o json | python3 -c '
+    GPU_NODES=$($KUBECTL get nodes -o json 2>/dev/null | python3 -c '
 import json, sys
 nodes = json.load(sys.stdin)["items"]
-print(sum(1 for n in nodes if int(n["status"].get("allocatable", {}).get("nvidia.com/gpu", "0") or 0) > 0))')
+print(sum(1 for n in nodes if int(n["status"].get("allocatable", {}).get("nvidia.com/gpu", "0") or 0) > 0))' 2>/dev/null) || GPU_NODES=0
     [ "$GPU_NODES" -ge "${#NODES[@]}" ] && { echo "GPUs allocatable on ${GPU_NODES} node(s)." >&2; break; }
     [ "$i" -eq 90 ] && { echo "Error: GPUs allocatable on ${GPU_NODES} of ${#NODES[@]} node(s) after 30 minutes." >&2; $KUBECTL get pods -n gpu-operator >&2 || true; exit 1; }
     sleep 20
@@ -419,9 +429,19 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "${NGC_API_KEY:-}" ]; then
     echo "Creating NGC image pull secret in the default namespace..." >&2
-    $KUBECTL create secret docker-registry ngc-hpc-pull-secret \
-        --docker-server=nvcr.io --docker-username='$oauthtoken' --docker-password="${NGC_API_KEY}" \
-        -n default --dry-run=client -o yaml 2>/dev/null \
+    # The key reaches python on stdin, never a command line, where ps would show it.
+    printf '%s' "$NGC_API_KEY" | python3 -c '
+import base64, json, sys
+key = sys.stdin.read()
+auth = base64.b64encode(("$oauthtoken:" + key).encode()).decode()
+config = {"auths": {"nvcr.io": {"username": "$oauthtoken", "password": key, "auth": auth}}}
+print(json.dumps({
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "type": "kubernetes.io/dockerconfigjson",
+    "metadata": {"name": "ngc-hpc-pull-secret", "namespace": "default"},
+    "data": {".dockerconfigjson": base64.b64encode(json.dumps(config).encode()).decode()},
+}))' 2>/dev/null \
         | $KUBECTL apply -f - >/dev/null 2>&1 \
         && $KUBECTL patch serviceaccount default -n default \
             -p '{"imagePullSecrets": [{"name": "ngc-hpc-pull-secret"}]}' >/dev/null 2>&1 \
@@ -436,13 +456,15 @@ fi
 # cluster. It runs from a pod on the control plane cluster instead, whose
 # egress address is outside the allowlist, and must be blocked. Any HTTP
 # answer, a 401 included, counts as reachable, so an authentication error can
-# never pass for a network ACL. The probe bounds its own run time well inside
-# the check's probe_timeout_s and exits 127 on any failure of its own.
+# never pass for a network ACL. The pod first reaches the API server through
+# its ClusterIP Service, which the source ranges do not cover, so a pod with no
+# network at all cannot pass as blocked. The probe bounds its own run time well
+# inside the check's probe_timeout_s and exits 127 on any failure of its own.
 # ---------------------------------------------------------------------------
 ACL_PROBE="${VCLUSTER_KUBECONFIG_PATH}.acl-probe.sh"
 rm -f "$ACL_PROBE"
 # Clouds publish an IP (GKE, AKS) or a hostname (AWS load balancers).
-_ACL_LB=$(kubectl --kubeconfig="$HOST_KUBECONFIG" get svc "$VCLUSTER_NAME" -n "$VCLUSTER_NAMESPACE" \
+_ACL_LB=$(host_kubectl get svc "$VCLUSTER_NAME" -n "$VCLUSTER_NAMESPACE" \
     -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
 if [ -n "$_ACL_LB" ]; then
     echo "Tenant API LoadBalancer: ${_ACL_LB}" >&2
@@ -455,11 +477,12 @@ if [ -n "$_ACL_LB" ]; then
             echo '# egress address is outside the allowlist.'
             echo '# Exit 0: reachable (no ACL). Exit 1: blocked. Exit 127: the probe itself failed.'
             printf 'LB=%q\n' "$_ACL_LB"
+            printf 'SVC=%q\n' "${VCLUSTER_NAME}.${VCLUSTER_NAMESPACE}.svc"
             printf 'K=(kubectl --kubeconfig=%q --context=%q -n %q)\n' "$HOST_KUBECONFIG" "$HOST_CONTEXT" "$VCLUSTER_NAMESPACE"
             cat <<'PROBEEOF'
 POD="acl-probe-$$"
 if ! "${K[@]}" run "$POD" --restart=Never --image=curlimages/curl:8.11.1 --request-timeout=15s --command -- \
-        sh -c "curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" >/dev/null 2>&1; then
+        sh -c "curl -sk --max-time 10 -o /dev/null -w 'svc_http=%{http_code}' https://${SVC}/readyz; echo \" svc_rc=\$?\"; curl -sk --max-time 10 -o /dev/null -w 'http=%{http_code}' https://${LB}/readyz; echo \" rc=\$?\"" >/dev/null 2>&1; then
     echo "probe failed: could not create pod ${POD}"; exit 127
 fi
 OUT=""
@@ -467,6 +490,10 @@ if "${K[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${POD}" --time
     OUT=$("${K[@]}" logs "$POD" --request-timeout=10s 2>/dev/null)
 fi
 "${K[@]}" delete pod "$POD" --ignore-not-found --wait=false --request-timeout=10s >/dev/null 2>&1
+case "$OUT" in
+    *" svc_rc=0"*) ;;
+    *) echo "probe failed: the pod did not reach the API server's ClusterIP Service either: ${OUT:-no result within the time limit}"; exit 127 ;;
+esac
 case "$OUT" in
     *" rc=0"*) echo "reachable from the control plane cluster: ${OUT}"; exit 0 ;;
     *" rc=7"* | *" rc=28"*) echo "blocked from the control plane cluster: ${OUT}"; exit 1 ;;
