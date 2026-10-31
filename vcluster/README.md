@@ -156,8 +156,9 @@ gcloud compute instances create gpu-1 gpu-2 --zone <zone> \
 ## Results
 
 Against ai-cloud-validation v1.0.0 on the reference environment above, on
-2026-10-31, at provider commit 782d857. Results were not uploaded
-(`--no-upload`).
+2026-10-31, with the code of provider commit f76b8fc (782d857 before the
+rebase onto `main`; the commits after it change only docs). Results were not
+uploaded (`--no-upload`).
 
 **`k8s`**, every check in one run, the NIM workloads and CNCF conformance
 included:
@@ -176,16 +177,12 @@ skipped by the provider. vCluster's Private Nodes configuration is also
 [CNCF-certified](https://github.com/cncf/k8s-conformance/tree/master/v1.36/vcluster-with-private-nodes)
 for Kubernetes 1.36.
 
-**`control-plane`**: all 10 checks passed at 65d0542, with direct access to
-the control plane cluster. Since then only tenant creation and deletion changed
-(`create_tenant.py`, `delete_tenant.py`). A run at 782d857 passed API health,
-tenant creation and deletion, and access key creation and deletion. It reached
-the control plane cluster through vCluster Platform, because the runner's cloud
-session had expired. The Platform authenticates the suite's access key but
-then needs it to have impersonation rights, so AccessKeyAuthenticated failed
-with 403 and the four checks after it (access key disable and reject, tenant
-list and info) did not run. `ObjectStorageCrudCheck` is not configured:
-vCluster has no object storage API.
+**`control-plane`**: all 10 checks passed in one run, with direct access to
+the control plane cluster. `ObjectStorageCrudCheck` is not configured:
+vCluster has no object storage API. Run this suite with direct access: through
+vCluster Platform (`vcluster platform connect cluster`), the Platform
+authenticates the suite's access key but then needs it to have impersonation
+rights, so AccessKeyAuthenticated fails with 403.
 
 ## How the provider runs the `k8s` suite
 
