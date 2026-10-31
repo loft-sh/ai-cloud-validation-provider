@@ -149,9 +149,11 @@ tests:
           min_bus_bw_gbps: 0
 
         K8sGpuStressWorkload:
-          # nvcr.io/nvidia/pytorch:25.04-py3 is ~8 GB; on a cold node the pull
-          # alone can exceed the suite default of 300s.
-          timeout: 600
+          # The 1.0.0 default image, nvcr.io/nvidia/pytorch:26.08-py3, is 11 GB.
+          # On a cold reference node its pull took 6 minutes, and containerd
+          # restarts a pull that makes no progress for 5 minutes. Leave room
+          # for one restart.
+          timeout: 1200
 
         K8sNimInferenceWorkload:
           # L4 (24 GB): cap the context so the KV cache fits next to the 3B
